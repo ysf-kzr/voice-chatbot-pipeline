@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Voice Bot</title>
+<style>
+  :root {
+    --you-color: #06b6d4;   /* same cyan as --local console's "You:" lines */
+    --bot-color: #22c55e;   /* same green as --local console's "Bot:" lines */
+    --bg: #0f172a;
+    --panel: #1e293b;
+    --text: #e2e8f0;
+    --muted: #94a3b8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    padding: 1rem 1.5rem;
+    border-bottom: 1px solid #334155;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  h1 { font-size: 1.1rem; margin: 0; }
+  #status { color: var(--muted); font-size: 0.9rem; }
+  #messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 1.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+  .msg {
+    max-width: 70%;
+    padding: 0.6rem 0.9rem;
+    border-radius: 0.75rem;
+    line-height: 1.4;
+    white-space: pre-wrap;
+    background: var(--panel);
+  }
+  .msg.you {
+    align-self: flex-end;
+    border: 1px solid var(--you-color);
+  }
+  .msg.bot {
+    align-self: flex-start;
+    border: 1px solid var(--bot-color);
+  }
+  .msg .label {
+    display: block;
+    font-size: 0.75rem;
+    font-weight: 600;
+    margin-bottom: 0.2rem;
+  }
+  .msg.you .label { color: var(--you-color); }
+  .msg.bot .label { color: var(--bot-color); }
+  footer {
+    padding: 1rem 1.5rem;
+    border-top: 1px solid #334155;
+    display: flex;
+    justify-content: center;
+  }
+  button {
+    background: var(--bot-color);
+    color: #052e16;
+    border: none;
+    padding: 0.7rem 1.6rem;
+    border-radius: 0.5rem;
+    font-weight: 600;
+    cursor: pointer;
+    font-size: 0.95rem;
+  }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Voice Bot</h1>
+    <span id="status">Disconnected</span>
+  </header>
+
+  <div id="messages"></div>
+
+  <footer>
+    <button id="connectBtn">Connect &amp; talk</button>
+  </footer>
+
+  <script type="module">
+    // Loaded straight from a CDN (esm.sh builds an ES module on the fly from
+    // the real npm package) - no npm install / bundler needed for this demo.
+    // These are the same two packages pipecat's own prebuilt UI uses under
+    // the hood (confirmed by grepping its built JS bundle for the package
+    // names) - so this speaks the exact protocol bot.py's server expects.
+    // NOTE: confirmed live (by dynamic-importing this module in a browser
+    // console) that the class is exported as `PipecatClient`, not
+    // `RTVIClient` - the CDN-served package is newer than the version
+    // bot.py's dev dependency docs/examples might suggest. RTVIEvent (the
+    // event-name enum) kept its original name.
+    import { PipecatClient, RTVIEvent } from "https://esm.sh/@pipecat-ai/client-js";
+    import { SmallWebRTCTransport } from "https://esm.sh/@pipecat-ai/small-webrtc-transport";
+
+    // bot.py's WebRTC signaling endpoint (see pipecat's SmallWebRTCRequestHandler
+    // in the venv: POST here with an SDP offer, get an SDP answer back - this
+    // is the same "/api/offer" route the runner sets up regardless of any
+    // frontend, so nothing in bot.py needs to change for this page to work).
+    const BOT_OFFER_URL = "http://localhost:7860/api/offer";
+
+    const messagesEl = document.getElementById("messages");
+    const statusEl = document.getElementById("status");
+    const connectBtn = document.getElementById("connectBtn");
+
+    // The bubble currently being streamed into by BotLlmText events - text
+    // arrives as multiple small chunks between BotLlmStarted/BotLlmStopped,
+    // not as one complete message, so we keep appending to the same DOM node
+    // until BotLlmStopped closes it out. Mirrors exactly what bot.py's
+    // _print_chat/_print_thinking do for the --local console, just rendered
+    // as a growing bubble instead of overwriting a terminal line.
+    let currentBotBubble = null;
+
+    function addMessage(role, text) {
+      const wrapper = document.createElement("div");
+      wrapper.className = `msg ${role}`;
+      const label = document.createElement("span");
+      label.className = "label";
+      label.textContent = role === "you" ? "You" : "Bot";
+      const body = document.createElement("span");
+      body.textContent = text;
+      wrapper.appendChild(label);
+      wrapper.appendChild(body);
+      messagesEl.appendChild(wrapper);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+      return body; // return the text node's parent so callers can append to it
+    }
+
+    function setStatus(text) {
+      statusEl.textContent = text;
+    }
+
+    // `webrtcRequestParams` (not `connectionUrl`) is current as of
+    // small-webrtc-transport 1.x - confirmed live by reading the deprecation
+    // warning + the transport's own source in a browser console.
+    const transport = new SmallWebRTCTransport({
+      webrtcRequestParams: { endpoint: BOT_OFFER_URL },
+    });
+
+    const client = new PipecatClient({
+      transport,
+      enableMic: true,
+      enableCam: false,
+    });
+
+    // Every one of these event names/payloads was confirmed directly against
+    // bot.py's own RTVI message classes (pipecat.processors.frameworks.rtvi.models)
+    // rather than guessed - e.g. BotLlmText's payload is {text: "..."} because
+    // that's exactly what TextMessageData declares server-side.
+    client.on(RTVIEvent.Connected, () => setStatus("Connected - waiting for bot..."));
+    client.on(RTVIEvent.Disconnected, () => {
+      setStatus("Disconnected");
+      connectBtn.disabled = false;
+      currentBotBubble = null;
+    });
+    client.on(RTVIEvent.BotReady, () => setStatus("Ready - say something!"));
+
+    client.on(RTVIEvent.UserStartedSpeaking, () => setStatus("Listening..."));
+    client.on(RTVIEvent.UserStoppedSpeaking, () => setStatus("Thinking..."));
+
+    client.on(RTVIEvent.UserTranscript, (data) => {
+      // "final" distinguishes a settled transcript from an in-progress one -
+      // only render the final version so the chat log doesn't fill up with
+      // every intermediate guess Whisper made while you were still talking.
+      if (data.final) addMessage("you", data.text);
+    });
+
+    client.on(RTVIEvent.BotLlmStarted, () => {
+      currentBotBubble = addMessage("bot", "");
+    });
+
+    client.on(RTVIEvent.BotLlmText, (data) => {
+      // Defensive: a standalone push (greeting/fallback apology in bot.py)
+      // still sends BotLlmStarted first, so this should always find a bubble
+      // - but if that ordering ever slipped, better to create one late than
+      // silently drop the text.
+      if (!currentBotBubble) currentBotBubble = addMessage("bot", "");
+      currentBotBubble.textContent += data.text;
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    });
+
+    client.on(RTVIEvent.BotLlmStopped, () => {
+      currentBotBubble = null;
+      setStatus("Ready - say something!");
+    });
+
+    connectBtn.addEventListener("click", async () => {
+      connectBtn.disabled = true;
+      setStatus("Connecting...");
+      try {
+        await client.connect(); // triggers the mic permission prompt + WebRTC handshake
+      } catch (err) {
+        console.error("Failed to connect:", err);
+        setStatus("Connection failed - see console");
+        connectBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

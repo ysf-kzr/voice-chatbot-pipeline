@@ -182,12 +182,16 @@ FALLBACK_COOLDOWN_SECS = 5.0
 
 # Ordered fallback chain of Groq chat models to fail over across on a rate
 # limit, tried in order - the first is the one actually used until a rate
-# limit forces a move to the next. All three are tool-calling-capable (a
-# hard requirement here, given check_honda_price/browse_honda_page/
-# browse_mg_page), so any of them can run the pipeline correctly; they
-# differ mainly in Groq's per-model rate-limit tier and general capability.
+# limit forces a move to the next. Both are tool-calling-capable (a hard
+# requirement here, given check_honda_price/browse_honda_page/
+# browse_mg_page); llama-3.1-8b-instant is the weaker/faster fallback.
+#
+# llama3-groq-70b-8192-tool-use-preview (previously first in this chain) was
+# removed - confirmed live while testing the web client (see client/) that
+# Groq has fully decommissioned it (a hard 400 model_decommissioned error,
+# not a rate limit), and confirmed via GET /v1/models that these two are
+# the currently-available replacements.
 LLM_MODEL_FALLBACK_CHAIN = [
-    "llama3-groq-70b-8192-tool-use-preview",
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
 ]

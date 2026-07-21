@@ -35,6 +35,12 @@ Speak into your microphone; the bot's reply is delivered as text — over WebRTC
 
 Set `LOG_LEVEL=CONVO` to see just the conversation transcript (`User:`/`Bot:` lines) instead of full debug output — much cleaner for `--local` mode. Note this only applies to `--local`: the WebRTC path resets logging back to full debug internally right before starting the server (a `pipecat.runner.run.main()` behavior, not something this file controls).
 
+## Web UI
+
+`client/index.html` is a small standalone chat page (no build step, no npm install) that connects to the bot's WebRTC endpoint using Pipecat's official `@pipecat-ai/client-js` + `@pipecat-ai/small-webrtc-transport` packages, loaded straight from a CDN. With `python bot.py` running, just open `client/index.html` directly in a browser and click "Connect & talk" - your speech shows up as a "You:" bubble, the bot's reply streams in as a "Bot:" bubble, styled with the same cyan/green split as the `--local` console.
+
+It talks to whatever `bot.py` is currently serving at `http://localhost:7860/api/offer` - nothing in `bot.py` had to change for this to work, since the backend already spoke RTVI correctly.
+
 ## Tool-calling demo
 
 The bot can answer real questions about Honda Pakistan by fetching live data, not guessing:
