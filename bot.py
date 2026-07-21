@@ -180,6 +180,18 @@ GREETING_MESSAGE = "Hi! How can I help you today?"
 FALLBACK_ERROR_MESSAGE = "Sorry, I hit a glitch there. Could you say that again?"
 FALLBACK_COOLDOWN_SECS = 5.0
 
+# Ordered fallback chain of Groq chat models to fail over across on a rate
+# limit, tried in order - the first is the one actually used until a rate
+# limit forces a move to the next. All three are tool-calling-capable (a
+# hard requirement here, given check_honda_price/browse_honda_page/
+# browse_mg_page), so any of them can run the pipeline correctly; they
+# differ mainly in Groq's per-model rate-limit tier and general capability.
+LLM_MODEL_FALLBACK_CHAIN = [
+    "llama3-groq-70b-8192-tool-use-preview",
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+]
+
 # Worked example of tool calling against a REAL website (not fake/hardcoded
 # data): honda.com.pk's homepage includes a mega-menu block, present on
 # every page, listing each model line's current starting price - e.g.
@@ -382,9 +394,9 @@ HONDA_PAGE_SLUGS = {
 }
 
 # Cache extracted page text briefly, per slug - same politeness rationale
-# as the price cache above.
-_page_text_cache: dict[str, str] = {}
-_page_text_cache_time: dict[str, float] = {}
+# as the price cache above. These are shared cache *sizing* constants only -
+# each site's browse tool (see make_browse_page_tool below) keeps its own
+# private cache dict, since page content and slugs never overlap across sites.
 _PAGE_CACHE_TTL_SECS = 300.0
 _PAGE_TEXT_MAX_CHARS = 3000
 # A 200 OK response can still be a bot-challenge page or a near-empty error
@@ -396,16 +408,19 @@ _PAGE_TEXT_MAX_CHARS = 3000
 _PAGE_TEXT_MIN_CHARS = 200
 
 
-def _fetch_and_extract_page_sync(slug: str) -> str:
+def _fetch_and_extract_page_sync(base_url: str, slug: str) -> str:
     """Blocking fetch + HTML-to-text extraction, run in a background thread.
 
     Uses the same curl_cffi Chrome-impersonation approach as
-    `_fetch_honda_homepage_sync` (see that docstring for why) since this
-    hits the same Cloudflare-protected site. Strips script/style/nav/footer
+    `_fetch_honda_homepage_sync` (see that docstring for why) since Honda's
+    site sits behind the same Cloudflare protection - kept here for every
+    site's browse tool even where it isn't strictly required (MG's site
+    isn't Cloudflare-blocked), for one consistent, tested fetch path rather
+    than a second, less battle-tested one. Strips script/style/nav/footer
     noise and returns plain, readable text for the LLM to read - real page
     content, not a summary or paraphrase we wrote ourselves.
     """
-    url = f"https://www.honda.com.pk/{slug}"
+    url = f"{base_url}/{slug}"
     response = curl_requests.get(url, impersonate="chrome", timeout=10)
     response.raise_for_status()
 
@@ -416,107 +431,126 @@ def _fetch_and_extract_page_sync(slug: str) -> str:
     return text[:_PAGE_TEXT_MAX_CHARS]
 
 
-async def browse_honda_page(params: FunctionCallParams):
-    """Tool handler: fetches and reads a real page on honda.com.pk.
+def make_browse_page_tool(
+    *,
+    tool_name: str,
+    site_label: str,
+    base_url: str,
+    page_slugs: dict[str, str],
+    description: str,
+    topic_hint: str,
+) -> FunctionSchema:
+    """Builds a "browse this real site's pages" tool.
 
-    Called by the LLM whenever it decides the user is asking about
-    something on the site other than price - specs, features, dealer
-    info, promotions, company info, policies. `params.arguments["topic"]`
-    is matched (loosely) against `HONDA_PAGE_SLUGS` to find the real page.
+    Factored out after Honda's and MG Motors' browse-tool implementations
+    turned out ~90% identical (same fetch/extract, same fuzzy topic match,
+    same cache-with-stale-fallback, same min-length bot-challenge check) -
+    duplicating a third copy for a future site would just be more of the
+    same bug surface times three. Each call gets its own private page-text
+    cache (closed over here, not module-global), since topic->slug maps and
+    page content never overlap between sites - safe to call once per site.
     """
-    topic = str(params.arguments.get("topic", "")).strip().lower()
-    slug = HONDA_PAGE_SLUGS.get(topic)
+    page_text_cache: dict[str, str] = {}
+    page_text_cache_time: dict[str, float] = {}
 
-    if slug is None:
-        # Loose fallback: does any known topic phrase appear in what the
-        # model sent, or vice versa? Handles near-misses like "civics" or
-        # "the hrv model" without needing an exact dict key match.
-        slug = next(
-            (s for key, s in HONDA_PAGE_SLUGS.items() if key in topic or topic in key),
-            None,
-        )
+    async def handler(params: FunctionCallParams):
+        topic = str(params.arguments.get("topic", "")).strip().lower()
+        slug = page_slugs.get(topic)
 
-    if slug is None:
-        logger.log("CONVO", f"[tool call] browse_honda_page(topic={topic!r}) -> no match")
-        await params.result_callback(
-            {
-                "topic": topic,
-                "found": False,
-                "available_topics": sorted(set(HONDA_PAGE_SLUGS.keys())),
-            }
-        )
-        return
+        if slug is None:
+            # Loose fallback: does any known topic phrase appear in what the
+            # model sent, or vice versa? Handles near-misses like "civics"
+            # or "the hrv model" without needing an exact dict key match.
+            slug = next(
+                (s for key, s in page_slugs.items() if key in topic or topic in key),
+                None,
+            )
 
-    now = time.monotonic()
-    cached = _page_text_cache.get(slug)
-    fresh_age = now - _page_text_cache_time.get(slug, 0)
-    if cached is not None and fresh_age < _PAGE_CACHE_TTL_SECS:
-        text = cached
-    else:
-        try:
-            text = await asyncio.to_thread(_fetch_and_extract_page_sync, slug)
-        except curl_requests.exceptions.RequestException as e:
-            # Fall back to a stale cache rather than failing outright - same
-            # reasoning as _get_honda_prices' stale-cache fallback above.
-            if cached is not None:
-                logger.warning(
-                    f"[tool call] browse_honda_page: fetch failed for {slug!r}, "
-                    f"falling back to stale cache ({fresh_age:.0f}s old)."
-                )
-                text = cached
-            else:
-                logger.error(f"[tool call] browse_honda_page: fetch failed for {slug!r}: {e}")
-                await params.result_callback(
-                    {
-                        "topic": topic,
-                        "found": False,
-                        "error": "could not reach honda.com.pk right now",
-                    }
-                )
-                return
+        if slug is None:
+            logger.log("CONVO", f"[tool call] {tool_name}(topic={topic!r}) -> no match")
+            await params.result_callback(
+                {
+                    "topic": topic,
+                    "found": False,
+                    "available_topics": sorted(set(page_slugs.keys())),
+                }
+            )
+            return
+
+        now = time.monotonic()
+        cached = page_text_cache.get(slug)
+        fresh_age = now - page_text_cache_time.get(slug, 0)
+        if cached is not None and fresh_age < _PAGE_CACHE_TTL_SECS:
+            text = cached
         else:
-            _page_text_cache[slug] = text
-            _page_text_cache_time[slug] = now
+            try:
+                text = await asyncio.to_thread(_fetch_and_extract_page_sync, base_url, slug)
+            except curl_requests.exceptions.RequestException as e:
+                # Fall back to a stale cache rather than failing outright -
+                # same reasoning as _get_honda_prices' stale-cache fallback.
+                if cached is not None:
+                    logger.warning(
+                        f"[tool call] {tool_name}: fetch failed for {slug!r}, "
+                        f"falling back to stale cache ({fresh_age:.0f}s old)."
+                    )
+                    text = cached
+                else:
+                    logger.error(f"[tool call] {tool_name}: fetch failed for {slug!r}: {e}")
+                    await params.result_callback(
+                        {
+                            "topic": topic,
+                            "found": False,
+                            "error": f"could not reach {site_label} right now",
+                        }
+                    )
+                    return
+            else:
+                page_text_cache[slug] = text
+                page_text_cache_time[slug] = now
 
-    if len(text) < _PAGE_TEXT_MIN_CHARS:
-        logger.error(
-            f"[tool call] browse_honda_page: fetched {slug!r} but got only "
-            f"{len(text)} chars of content - likely a bot-challenge page or "
-            f"a site change, not real page content."
-        )
-        await params.result_callback(
-            {
-                "topic": topic,
-                "found": False,
-                "error": "could not verify this page's content right now",
-            }
-        )
-        return
+        if len(text) < _PAGE_TEXT_MIN_CHARS:
+            logger.error(
+                f"[tool call] {tool_name}: fetched {slug!r} but got only "
+                f"{len(text)} chars of content - likely a bot-challenge page "
+                f"or a site change, not real page content."
+            )
+            await params.result_callback(
+                {
+                    "topic": topic,
+                    "found": False,
+                    "error": "could not verify this page's content right now",
+                }
+            )
+            return
 
-    logger.log(
-        "CONVO", f"[tool call] browse_honda_page(topic={topic!r}) -> {slug} ({len(text)} chars)"
+        logger.log(
+            "CONVO", f"[tool call] {tool_name}(topic={topic!r}) -> {slug} ({len(text)} chars)"
+        )
+        await params.result_callback({"topic": topic, "found": True, "page_content": text})
+
+    return FunctionSchema(
+        name=tool_name,
+        description=description,
+        properties={"topic": {"type": "string", "description": topic_hint}},
+        required=["topic"],
+        handler=handler,
     )
-    await params.result_callback({"topic": topic, "found": True, "page_content": text})
 
 
-browse_honda_page_tool = FunctionSchema(
-    name="browse_honda_page",
+browse_honda_page_tool = make_browse_page_tool(
+    tool_name="browse_honda_page",
+    site_label="honda.com.pk",
+    base_url="https://www.honda.com.pk",
+    page_slugs=HONDA_PAGE_SLUGS,
     description=(
         "Fetch and read a real page from the honda.com.pk website to answer "
         "questions about model specs/features, dealer or contact info, "
         "promotions, company info, or policies - anything other than price."
     ),
-    properties={
-        "topic": {
-            "type": "string",
-            "description": (
-                "What to look up, e.g. 'Civic specs', 'dealer locations', "
-                "'contact info', 'promotions', 'about honda'."
-            ),
-        }
-    },
-    required=["topic"],
-    handler=browse_honda_page,
+    topic_hint=(
+        "What to look up, e.g. 'Civic specs', 'dealer locations', "
+        "'contact info', 'promotions', 'about honda'."
+    ),
 )
 
 # ---------------------------------------------------------------------------
@@ -591,111 +625,21 @@ MG_PAGE_SLUGS = {
     "privacy policy": "privacy-policy",
 }
 
-_mg_page_text_cache: dict[str, str] = {}
-_mg_page_text_cache_time: dict[str, float] = {}
-
-
-def _fetch_mg_page_sync(slug: str) -> str:
-    url = f"{MG_BASE_URL}/{slug}"
-    response = curl_requests.get(url, impersonate="chrome", timeout=10)
-    response.raise_for_status()
-    soup = BeautifulSoup(response.text, "html.parser")
-    for tag in soup(["script", "style", "nav", "footer", "noscript", "svg"]):
-        tag.decompose()
-    text = " ".join(soup.get_text(separator=" ", strip=True).split())
-    return text[:_PAGE_TEXT_MAX_CHARS]
-
-
-async def browse_mg_page(params: FunctionCallParams):
-    """Tool handler: fetches and reads a real page on mgmotors.com.pk."""
-    topic = str(params.arguments.get("topic", "")).strip().lower()
-    slug = MG_PAGE_SLUGS.get(topic)
-
-    if slug is None:
-        slug = next(
-            (s for key, s in MG_PAGE_SLUGS.items() if key in topic or topic in key),
-            None,
-        )
-
-    if slug is None:
-        logger.log("CONVO", f"[tool call] browse_mg_page(topic={topic!r}) -> no match")
-        await params.result_callback(
-            {
-                "topic": topic,
-                "found": False,
-                "available_topics": sorted(set(MG_PAGE_SLUGS.keys())),
-            }
-        )
-        return
-
-    now = time.monotonic()
-    cached = _mg_page_text_cache.get(slug)
-    fresh_age = now - _mg_page_text_cache_time.get(slug, 0)
-    if cached is not None and fresh_age < _PAGE_CACHE_TTL_SECS:
-        text = cached
-    else:
-        try:
-            text = await asyncio.to_thread(_fetch_mg_page_sync, slug)
-        except curl_requests.exceptions.RequestException as e:
-            if cached is not None:
-                logger.warning(
-                    f"[tool call] browse_mg_page: fetch failed for {slug!r}, "
-                    f"falling back to stale cache ({fresh_age:.0f}s old)."
-                )
-                text = cached
-            else:
-                logger.error(f"[tool call] browse_mg_page: fetch failed for {slug!r}: {e}")
-                await params.result_callback(
-                    {
-                        "topic": topic,
-                        "found": False,
-                        "error": "could not reach mgmotors.com.pk right now",
-                    }
-                )
-                return
-        else:
-            _mg_page_text_cache[slug] = text
-            _mg_page_text_cache_time[slug] = now
-
-    if len(text) < _PAGE_TEXT_MIN_CHARS:
-        logger.error(
-            f"[tool call] browse_mg_page: fetched {slug!r} but got only "
-            f"{len(text)} chars - likely a bot-challenge page or site change."
-        )
-        await params.result_callback(
-            {
-                "topic": topic,
-                "found": False,
-                "error": "could not verify this page's content right now",
-            }
-        )
-        return
-
-    logger.log(
-        "CONVO", f"[tool call] browse_mg_page(topic={topic!r}) -> {slug} ({len(text)} chars)"
-    )
-    await params.result_callback({"topic": topic, "found": True, "page_content": text})
-
-
-browse_mg_page_tool = FunctionSchema(
-    name="browse_mg_page",
+browse_mg_page_tool = make_browse_page_tool(
+    tool_name="browse_mg_page",
+    site_label="mgmotors.com.pk",
+    base_url=MG_BASE_URL,
+    page_slugs=MG_PAGE_SLUGS,
     description=(
         "Fetch and read a real page from the mgmotors.com.pk website to answer "
         "questions about MG Motors Pakistan - model specs/features, dealer "
         "locations, financing/bank partnerships, offers, after-sales service, "
         "contact info, or company info. MG does not list prices on their site."
     ),
-    properties={
-        "topic": {
-            "type": "string",
-            "description": (
-                "What to look up, e.g. 'MG HS specs', 'dealer locations', "
-                "'financing', 'MG4 EV', 'Cyberster', 'contact', 'offers'."
-            ),
-        }
-    },
-    required=["topic"],
-    handler=browse_mg_page,
+    topic_hint=(
+        "What to look up, e.g. 'MG HS specs', 'dealer locations', "
+        "'financing', 'MG4 EV', 'Cyberster', 'contact', 'offers'."
+    ),
 )
 
 
@@ -892,11 +836,13 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
     llm = GroqLLMService(
         api_key=os.environ["GROQ_API_KEY"],
         settings=GroqLLMService.Settings(
-            # llama3-groq-70b-8192-tool-use-preview is Groq's dedicated
+            # First entry in LLM_MODEL_FALLBACK_CHAIN - Groq's dedicated
             # tool-calling variant: specifically fine-tuned for function
             # calling, higher rate limits than llama-3.3-70b-versatile,
             # and far better tool-use accuracy than the 8B instant model.
-            model="llama3-groq-70b-8192-tool-use-preview",
+            # on_pipeline_error below switches llm._settings.model to the
+            # next entry in the chain if this one gets rate-limited.
+            model=LLM_MODEL_FALLBACK_CHAIN[0],
             system_instruction=SYSTEM_INSTRUCTION,
             # The original 150-token cap existed to bound worst-case TTS
             # synthesis time in the audio variant - that reason doesn't
@@ -1034,13 +980,34 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
     consecutive_fallback_failures = 0
     circuit_open_until = 0.0
     CIRCUIT_BREAKER_MAX_BACKOFF_SECS = 60.0
+    current_model_index = 0
 
     @worker.event_handler("on_pipeline_error")
     async def on_pipeline_error(worker, frame: ErrorFrame):
-        nonlocal consecutive_fallback_failures, circuit_open_until
+        nonlocal consecutive_fallback_failures, circuit_open_until, current_model_index
         logger.error(f"Pipeline error from {frame.processor}: {frame.error}")
         if frame.fatal:
             return
+
+        # A rate limit is a distinct failure mode from a transient hiccup -
+        # backing off and retrying the SAME model just burns the cooldown
+        # for nothing if that model's quota is genuinely exhausted for the
+        # window. Moving to the next model in the fallback chain means the
+        # very next turn has a real chance of succeeding, not just a slower
+        # retry of the thing that already failed. Checked via substring
+        # match on the error text since GroqLLMService/the underlying Groq
+        # client don't expose a typed rate-limit exception class here.
+        error_text = str(frame.error).lower()
+        is_rate_limit = "rate_limit" in error_text or "429" in error_text or "rate limit" in error_text
+        if is_rate_limit and current_model_index + 1 < len(LLM_MODEL_FALLBACK_CHAIN):
+            previous_model = LLM_MODEL_FALLBACK_CHAIN[current_model_index]
+            current_model_index += 1
+            next_model = LLM_MODEL_FALLBACK_CHAIN[current_model_index]
+            llm._settings.model = next_model
+            logger.error(
+                f"Rate limit hit on {previous_model!r} - switching LLM "
+                f"model to {next_model!r} for subsequent turns."
+            )
 
         now = time.monotonic()
         if now < circuit_open_until:
