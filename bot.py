@@ -657,8 +657,28 @@ def _avg_logprob(result: Transcription) -> float:
     return sum(getattr(s, "avg_logprob", 0.0) for s in segments) / len(segments)
 
 
+# Whisper's own output script for language="ur" is Perso-Arabic (Nastaliq) -
+# that's what its training data maps that language token to. There's no
+# separate "romanized Urdu" language code to force instead. The standard
+# workaround (used here) is to feed Whisper's `prompt` param - which
+# actually conditions the decoder on preceding context tokens, not just a
+# hint - a short sample already written in Roman Urdu. Whisper strongly
+# tends to continue transcribing in whatever script its prompt was written
+# in, so this reliably shifts output to Roman/Latin script instead of
+# Nastaliq. Heuristic, not a documented API guarantee: works because of how
+# prompt-conditioning happens to interact with script selection, not because
+# Whisper has an explicit "romanize" mode - a sample covering common
+# sentence shapes (question, statement, request) gives the decoder more to
+# latch onto than a single short phrase would.
+_ROMAN_URDU_STT_PROMPT = (
+    "Assalam alaikum, aap kaisay hain? Mujhe iski qeemat maloom karni hai. "
+    "Yeh gari kitne ki hai? Mehrbani karke dealer ka number bata dein."
+)
+
+
 class BilingualGroqSTTService(GroqSTTService):
-    """GroqSTTService constrained to a closed set of two languages: English and Urdu.
+    """GroqSTTService constrained to a closed set of two languages: English and
+    Roman Urdu (Urdu spoken, but transcribed in Latin script, not Nastaliq).
 
     Whisper's own language auto-detection was tried and misdetected short
     Urdu clips as Chinese - it's unconstrained across every language Whisper
@@ -666,10 +686,11 @@ class BilingualGroqSTTService(GroqSTTService):
     to distinguish two specific languages.
 
     Instead, each utterance is transcribed twice concurrently - once forced
-    to `language="en"`, once forced to `language="ur"` - and whichever
-    result has the higher average segment confidence (avg_logprob) wins.
-    Forcing removes the third-language misdetection failure mode entirely,
-    since Whisper is never given the option to guess anything else.
+    to `language="en"`, once forced to `language="ur"` (with a Roman-script
+    prompt bias - see `_ROMAN_URDU_STT_PROMPT` above) - and whichever result
+    has the higher average segment confidence (avg_logprob) wins. Forcing
+    removes the third-language misdetection failure mode entirely, since
+    Whisper is never given the option to guess anything else.
 
     Trade-off: this doubles Groq STT API calls per turn. Both calls run
     concurrently via asyncio.gather, so wall-clock latency is roughly the
@@ -681,6 +702,8 @@ class BilingualGroqSTTService(GroqSTTService):
     that constraint doesn't actually apply to this text-output variant (any
     script can be displayed as text), but the English-only instruction was
     kept as-is here to keep behavior consistent between the two variants.
+    Reading Roman Urdu input and replying in English works fine for the LLM
+    either way.
     """
 
     async def _transcribe(self, audio: bytes) -> Transcription:
@@ -689,14 +712,22 @@ class BilingualGroqSTTService(GroqSTTService):
             "model": self._settings.model,
             "response_format": "verbose_json",
         }
-        if self._settings.prompt is not None:
-            base_kwargs["prompt"] = self._settings.prompt
         if self._settings.temperature is not None:
             base_kwargs["temperature"] = self._settings.temperature
 
+        en_kwargs = dict(base_kwargs)
+        if self._settings.prompt is not None:
+            en_kwargs["prompt"] = self._settings.prompt
+
+        # The Roman-Urdu prompt bias only makes sense for the "ur" call -
+        # applying it to "en" as well would risk nudging clean English
+        # audio toward the same style for no benefit.
+        ur_kwargs = dict(base_kwargs)
+        ur_kwargs["prompt"] = self._settings.prompt or _ROMAN_URDU_STT_PROMPT
+
         result_en, result_ur = await asyncio.gather(
-            self._client.audio.transcriptions.create(language="en", **base_kwargs),
-            self._client.audio.transcriptions.create(language="ur", **base_kwargs),
+            self._client.audio.transcriptions.create(language="en", **en_kwargs),
+            self._client.audio.transcriptions.create(language="ur", **ur_kwargs),
         )
 
         conf_en, conf_ur = _avg_logprob(result_en), _avg_logprob(result_ur)
@@ -705,7 +736,8 @@ class BilingualGroqSTTService(GroqSTTService):
         )
 
         # repr() is ASCII-safe: shows \uXXXX escapes for non-Latin chars so
-        # you can tell whether Whisper returned actual Urdu Unicode or English.
+        # you can spot it immediately if Whisper ever slips back into
+        # native Urdu (Nastaliq) script instead of the intended Roman one.
         logger.debug(
             f"STT bilingual pick: lang={lang} conf={conf:.3f} "
             f"(en={conf_en:.3f} ur={conf_ur:.3f}) text={repr(winner.text)}"
