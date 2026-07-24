@@ -1017,6 +1017,35 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
     circuit_open_until = 0.0
     CIRCUIT_BREAKER_MAX_BACKOFF_SECS = 60.0
     current_model_index = 0
+    # Once a rate limit forces a move off the primary model, nothing was
+    # previously moving things back - a fallback model, once switched to,
+    # stayed in use for the rest of the process's life even long after
+    # the primary's rate-limit window had reset. This task, (re)scheduled
+    # every time a switch happens, moves back to the primary model after a
+    # cooldown with no further rate limits - so a transient spike doesn't
+    # permanently downgrade every future conversation to the weaker model.
+    model_fallback_reset_task: asyncio.Task | None = None
+    MODEL_FALLBACK_RESET_SECS = 600.0  # 10 minutes
+
+    def _schedule_model_fallback_reset():
+        nonlocal model_fallback_reset_task
+
+        async def _reset_after_delay():
+            nonlocal current_model_index
+            await asyncio.sleep(MODEL_FALLBACK_RESET_SECS)
+            primary_model = LLM_MODEL_FALLBACK_CHAIN[0]
+            logger.warning(
+                f"Retrying primary LLM model {primary_model!r} after "
+                f"{MODEL_FALLBACK_RESET_SECS:.0f}s on a fallback model."
+            )
+            current_model_index = 0
+            llm._settings.model = primary_model
+
+        # A second rate limit before the previous timer fires should push
+        # the reset further out, not race two resets against each other.
+        if model_fallback_reset_task and not model_fallback_reset_task.done():
+            model_fallback_reset_task.cancel()
+        model_fallback_reset_task = asyncio.create_task(_reset_after_delay())
 
     @worker.event_handler("on_pipeline_error")
     async def on_pipeline_error(worker, frame: ErrorFrame):
@@ -1044,6 +1073,7 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
                 f"Rate limit hit on {previous_model!r} - switching LLM "
                 f"model to {next_model!r} for subsequent turns."
             )
+            _schedule_model_fallback_reset()
 
         now = time.monotonic()
         if now < circuit_open_until:

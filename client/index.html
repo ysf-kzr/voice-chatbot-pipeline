@@ -69,6 +69,7 @@
     border-top: 1px solid #334155;
     display: flex;
     justify-content: center;
+    gap: 0.75rem;
   }
   button {
     background: var(--bot-color);
@@ -81,6 +82,24 @@
     font-size: 0.95rem;
   }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.secondary {
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid #475569;
+  }
+  button.muted {
+    border-color: var(--you-color);
+    color: var(--you-color);
+  }
+  button[hidden] { display: none; }
+  #errorBanner {
+    padding: 0.6rem 1.5rem;
+    background: #7f1d1d;
+    color: #fecaca;
+    font-size: 0.85rem;
+    border-bottom: 1px solid #991b1b;
+  }
+  #errorBanner[hidden] { display: none; }
 </style>
 </head>
 <body>
@@ -89,10 +108,14 @@
     <span id="status">Disconnected</span>
   </header>
 
+  <div id="errorBanner" hidden></div>
+
   <div id="messages"></div>
 
   <footer>
     <button id="connectBtn">Connect &amp; talk</button>
+    <button id="muteBtn" class="secondary" hidden>Mute mic</button>
+    <button id="disconnectBtn" class="secondary" hidden>Disconnect</button>
   </footer>
 
   <script type="module">
@@ -117,7 +140,36 @@
 
     const messagesEl = document.getElementById("messages");
     const statusEl = document.getElementById("status");
+    const errorBannerEl = document.getElementById("errorBanner");
     const connectBtn = document.getElementById("connectBtn");
+    const muteBtn = document.getElementById("muteBtn");
+    const disconnectBtn = document.getElementById("disconnectBtn");
+
+    let micEnabled = true;
+
+    function showError(text) {
+      errorBannerEl.textContent = text;
+      errorBannerEl.hidden = false;
+    }
+
+    function clearError() {
+      errorBannerEl.hidden = true;
+    }
+
+    // Swaps which controls are visible for the current connection state,
+    // instead of a full page reload to "reconnect" - disconnecting just
+    // brings back the original Connect button, ready to click again.
+    function setConnectedUI(connected) {
+      connectBtn.hidden = connected;
+      muteBtn.hidden = !connected;
+      disconnectBtn.hidden = !connected;
+      connectBtn.disabled = false;
+      if (!connected) {
+        micEnabled = true;
+        muteBtn.textContent = "Mute mic";
+        muteBtn.classList.remove("muted");
+      }
+    }
 
     // The bubble currently being streamed into by BotLlmText events - text
     // arrives as multiple small chunks between BotLlmStarted/BotLlmStopped,
@@ -163,13 +215,35 @@
     // bot.py's own RTVI message classes (pipecat.processors.frameworks.rtvi.models)
     // rather than guessed - e.g. BotLlmText's payload is {text: "..."} because
     // that's exactly what TextMessageData declares server-side.
-    client.on(RTVIEvent.Connected, () => setStatus("Connected - waiting for bot..."));
+    client.on(RTVIEvent.Connected, () => {
+      // NOT clearError() here - confirmed live that DeviceError can fire
+      // either before or after Connected (they're on independent tracks:
+      // RTC signaling vs. device permission), so clearing on Connected
+      // could immediately hide a real, still-relevant device error. Errors
+      // are only cleared on a fresh connect *attempt* (see connectBtn's
+      // click handler) - the one point where "start over" is unambiguous.
+      setStatus("Connected - waiting for bot...");
+      setConnectedUI(true);
+    });
     client.on(RTVIEvent.Disconnected, () => {
       setStatus("Disconnected");
-      connectBtn.disabled = false;
+      setConnectedUI(false);
       currentBotBubble = null;
     });
     client.on(RTVIEvent.BotReady, () => setStatus("Ready - say something!"));
+
+    // Previously only console.error'd, so a mid-session failure (mic
+    // dropped, transport error, etc.) was invisible to anyone not watching
+    // devtools. Surfaced as a real banner instead - cleared on the next
+    // successful (re)connect.
+    client.on(RTVIEvent.Error, (data) => {
+      console.error("RTVI error:", data);
+      showError(`Error: ${data?.message ?? "something went wrong - see console"}`);
+    });
+    client.on(RTVIEvent.DeviceError, (data) => {
+      console.error("Device error:", data);
+      showError(`Microphone error: ${data?.message ?? "could not access the microphone"}`);
+    });
 
     client.on(RTVIEvent.UserStartedSpeaking, () => setStatus("Listening..."));
     client.on(RTVIEvent.UserStoppedSpeaking, () => setStatus("Thinking..."));
@@ -202,14 +276,27 @@
 
     connectBtn.addEventListener("click", async () => {
       connectBtn.disabled = true;
+      clearError();
       setStatus("Connecting...");
       try {
         await client.connect(); // triggers the mic permission prompt + WebRTC handshake
       } catch (err) {
         console.error("Failed to connect:", err);
-        setStatus("Connection failed - see console");
+        setStatus("Connection failed");
+        showError(`Failed to connect: ${err?.message ?? err}`);
         connectBtn.disabled = false;
       }
+    });
+
+    muteBtn.addEventListener("click", () => {
+      micEnabled = !micEnabled;
+      client.enableMic(micEnabled);
+      muteBtn.textContent = micEnabled ? "Mute mic" : "Unmute mic";
+      muteBtn.classList.toggle("muted", !micEnabled);
+    });
+
+    disconnectBtn.addEventListener("click", () => {
+      client.disconnect(); // RTVIEvent.Disconnected above resets the UI
     });
   </script>
 </body>
