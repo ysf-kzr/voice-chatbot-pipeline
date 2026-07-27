@@ -29,7 +29,6 @@ Requires GROQ_API_KEY in a .env file.
 """
 
 import asyncio
-import dataclasses
 import os
 import re
 import sys
@@ -776,6 +775,30 @@ class TextSanitizer(FrameProcessor):
     real-time streaming - a tag split exactly across two separate streamed
     fragments could theoretically slip through partially. A narrow, accepted
     trade-off for keeping streaming immediate.
+
+    BUG FOUND AND FIXED (confirmed via live testing, not just code reading):
+    every reply was rendered twice, interleaved word-by-word, in the web
+    client (client/index.html) - e.g. "TheThe comparison between Honda and
+    MG can be done by looking at the comparison between...". The bot's own
+    logged final answer (assistant_aggregator's aggregated message.content)
+    was clean, proving the LLM only generated the text once - the
+    duplication was happening between the pipeline and the client.
+    Root cause, traced directly in the installed pipecat source: pipecat's
+    RTVIObserver dedupes frames it has already reported via `frame.id in
+    self._frames_seen` (pipecat/processors/frameworks/rtvi/observer.py).
+    `Frame.id` is auto-assigned in `__post_init__` and is NOT preserved by
+    `dataclasses.replace()` - replace() re-runs __init__/__post_init__, so
+    it mints a brand-new id even when only `text` changed. This processor
+    used to always call `dataclasses.replace(frame, text=sanitized)`, so
+    every single LLMTextFrame chunk got a fresh id here and the observer
+    (which also sees the frame at this exact processor-to-processor hop,
+    per pipecat's push_frame/on_push_frame wiring) treated it as a brand
+    new, distinct frame - sending a second "bot-llm-text" RTVI message for
+    every chunk, on top of the one already sent when `llm` first pushed it.
+    Fixed by mutating `frame.text` in place instead: `Frame` is a plain
+    (non-frozen) dataclass, so this is safe, and it keeps the frame's
+    original id intact in every case - including the actual tag-stripping
+    case, which used to still trigger this if it had ever fired for real.
     """
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -784,7 +807,8 @@ class TextSanitizer(FrameProcessor):
             sanitized = _HTML_TAG_PATTERN.sub("", frame.text)
             if sanitized != frame.text:
                 logger.warning(f"Stripped HTML-like tag from LLM output: {frame.text!r}")
-            await self.push_frame(dataclasses.replace(frame, text=sanitized), direction)
+                frame.text = sanitized
+            await self.push_frame(frame, direction)
             return
         await self.push_frame(frame, direction)
 
