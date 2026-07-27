@@ -531,10 +531,29 @@ def make_browse_page_tool(
         )
         await params.result_callback({"topic": topic, "found": True, "page_content": text})
 
+    # Constrains the model to a closed set of valid topics via JSON Schema
+    # `enum`, instead of letting it free-generate a phrase and hoping the
+    # fuzzy substring match below happens to recognize it. Measured directly
+    # against real topics an LLM sent in this pipeline before this change
+    # (e.g. "honda pakistan best selling models", "compare with other
+    # brands") - only 3 of 10 resolved to a real page; the rest returned a
+    # miss plus a dump of every valid topic back into context, which is
+    # exactly the kind of wasted round-trip that eats into rate limits. The
+    # loose substring match is kept as a safety net below, not removed -
+    # enum strongly biases well-behaved models but isn't a hard grammar
+    # constraint, so a model could still emit something off-list.
+    valid_topics = sorted(set(page_slugs.keys()))
+
     return FunctionSchema(
         name=tool_name,
         description=description,
-        properties={"topic": {"type": "string", "description": topic_hint}},
+        properties={
+            "topic": {
+                "type": "string",
+                "description": topic_hint,
+                "enum": valid_topics,
+            }
+        },
         required=["topic"],
         handler=handler,
     )

@@ -16,19 +16,22 @@ This is a sibling variant of the voice-in/voice-out bot on the `fix-edge-cases` 
 
    Get a free key at https://console.groq.com. No other API keys are needed.
 
-2. Install dependencies (venv lives on `D:\venvs\pipecat-voice` — C: was nearly full):
+2. Install dependencies (pinned to the exact versions this project is verified against):
 
    ```
-   D:\venvs\pipecat-voice\Scripts\python.exe -m pip install "pipecat-ai[groq,local,silero]" python-dotenv beautifulsoup4 curl_cffi
+   python -m venv .venv
+   .venv\Scripts\python.exe -m pip install -r requirements.txt
    ```
+
+   This project was developed against a venv on `D:\venvs\pipecat-voice` (C: was nearly full) — swap in that path below for `.venv` if you're continuing on that same machine, or use your own venv location.
 
 ## Run
 
 Two modes:
 
 ```
-D:\venvs\pipecat-voice\Scripts\python.exe bot.py             # WebRTC server; open http://localhost:7860
-D:\venvs\pipecat-voice\Scripts\python.exe bot.py --local     # Talk directly via the local mic
+.venv\Scripts\python.exe bot.py             # WebRTC server; open http://localhost:7860
+.venv\Scripts\python.exe bot.py --local     # Talk directly via the local mic
 ```
 
 Speak into your microphone; the bot's reply is delivered as text — over WebRTC it arrives at the connected client as an RTVI `bot-llm-text` message, in `--local` mode it only shows up in the console (`CONVO`-level log line), since there's no client to display it to. Ctrl+C to stop.

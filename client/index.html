@@ -148,8 +148,15 @@
     // `RTVIClient` - the CDN-served package is newer than the version
     // bot.py's dev dependency docs/examples might suggest. RTVIEvent (the
     // event-name enum) kept its original name.
-    import { PipecatClient, RTVIEvent } from "https://esm.sh/@pipecat-ai/client-js";
-    import { SmallWebRTCTransport } from "https://esm.sh/@pipecat-ai/small-webrtc-transport";
+    //
+    // Pinned to exact versions (not "latest") - confirmed live these are
+    // the ones actually running here (server-reported client_version /
+    // stack trace). An unpinned "latest" is exactly how the RTVIClient ->
+    // PipecatClient rename above silently broke this page once already;
+    // pinning means a future breaking release on the CDN can't do that
+    // again without a deliberate version bump here.
+    import { PipecatClient, RTVIEvent } from "https://esm.sh/@pipecat-ai/client-js@1.13.0";
+    import { SmallWebRTCTransport } from "https://esm.sh/@pipecat-ai/small-webrtc-transport@1.10.6";
 
     // bot.py's WebRTC signaling endpoint (see pipecat's SmallWebRTCRequestHandler
     // in the venv: POST here with an SDP offer, get an SDP answer back - this

@@ -1,0 +1,8 @@
+# Pinned to the exact versions verified working in this project (checked
+# via `pip freeze` against the actual dev venv). Install with:
+#   pip install -r requirements.txt
+pipecat-ai[groq,local,silero]==1.4.0
+python-dotenv==1.2.2
+beautifulsoup4==4.15.0
+curl_cffi==0.15.0
+PyAudio==0.2.14
