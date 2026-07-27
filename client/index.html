@@ -98,8 +98,24 @@
     color: #fecaca;
     font-size: 0.85rem;
     border-bottom: 1px solid #991b1b;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
   }
   #errorBanner[hidden] { display: none; }
+  #errorBannerClose {
+    background: none;
+    border: none;
+    color: #fecaca;
+    font-size: 1.1rem;
+    font-weight: 700;
+    line-height: 1;
+    padding: 0 0.25rem;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  #errorBannerClose:hover { color: #fff; }
 </style>
 </head>
 <body>
@@ -108,7 +124,10 @@
     <span id="status">Disconnected</span>
   </header>
 
-  <div id="errorBanner" hidden></div>
+  <div id="errorBanner" hidden>
+    <span id="errorBannerText"></span>
+    <button id="errorBannerClose" aria-label="Dismiss error">&times;</button>
+  </div>
 
   <div id="messages"></div>
 
@@ -141,6 +160,8 @@
     const messagesEl = document.getElementById("messages");
     const statusEl = document.getElementById("status");
     const errorBannerEl = document.getElementById("errorBanner");
+    const errorBannerTextEl = document.getElementById("errorBannerText");
+    const errorBannerCloseBtn = document.getElementById("errorBannerClose");
     const connectBtn = document.getElementById("connectBtn");
     const muteBtn = document.getElementById("muteBtn");
     const disconnectBtn = document.getElementById("disconnectBtn");
@@ -148,13 +169,18 @@
     let micEnabled = true;
 
     function showError(text) {
-      errorBannerEl.textContent = text;
+      // Text goes into its own child span now, not the banner's
+      // textContent directly - the close button is a sibling element that
+      // has to survive this call, not get wiped out by it.
+      errorBannerTextEl.textContent = text;
       errorBannerEl.hidden = false;
     }
 
     function clearError() {
       errorBannerEl.hidden = true;
     }
+
+    errorBannerCloseBtn.addEventListener("click", clearError);
 
     // Swaps which controls are visible for the current connection state,
     // instead of a full page reload to "reconnect" - disconnecting just
