@@ -84,6 +84,30 @@ wait_for_port() {
     return 0
 }
 
+wait_for_port_clear() {
+    # A flat `sleep 1` after kill_port was not enough: taskkill can return
+    # before Windows actually releases the socket, so the OLD process's
+    # listener can still show up in netstat when the NEXT scenario's
+    # wait_for_port checks "is something listening" - which only asks
+    # whether ANY listener exists, not whether it's the process THIS
+    # scenario just started. Confirmed directly: bot.py's own
+    # _check_port_available correctly refused to start for a fresh
+    # process (logged "already in use"), while wait_for_port below still
+    # found the stale listener and let the eval proceed against it - so a
+    # scenario could silently run against the PREVIOUS scenario's bot
+    # process instead of a fresh one, defeating the "fresh process per
+    # scenario" guarantee this whole script exists for.
+    local tries=0
+    while netstat -ano 2>/dev/null | grep ":$PORT" | grep -q LISTENING; do
+        sleep 1
+        tries=$((tries + 1))
+        if [ "$tries" -ge 15 ]; then
+            return 1
+        fi
+    done
+    return 0
+}
+
 echo "Running ${#SCENARIOS[@]} scenario(s)..."
 echo ""
 
@@ -102,7 +126,12 @@ for scenario in "${SCENARIOS[@]}"; do
         echo "  (starting bot with special env: $needs_special_env)"
     fi
     kill_port
-    sleep 1
+    if ! wait_for_port_clear; then
+        echo "  FAIL - a previous bot process wouldn't release :$PORT"
+        RESULTS["$name"]="FAIL"
+        DURATIONS["$name"]="-"
+        continue
+    fi
 
     bot_log="$LOG_DIR/${name}.bot.log"
     (
