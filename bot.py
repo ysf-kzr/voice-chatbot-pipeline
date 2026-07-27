@@ -186,11 +186,10 @@ FALLBACK_COOLDOWN_SECS = 5.0
 # requirement here, given check_honda_price/browse_honda_page/
 # browse_mg_page); llama-3.1-8b-instant is the weaker/faster fallback.
 #
-# llama3-groq-70b-8192-tool-use-preview (previously first in this chain) was
-# removed - confirmed live while testing the web client (see client/) that
+# Do not add llama3-groq-70b-8192-tool-use-preview back to this chain -
 # Groq has fully decommissioned it (a hard 400 model_decommissioned error,
-# not a rate limit), and confirmed via GET /v1/models that these two are
-# the currently-available replacements.
+# not a rate limit). Check GET /v1/models against Groq's API before adding
+# any other model here.
 LLM_MODEL_FALLBACK_CHAIN = [
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
@@ -220,16 +219,15 @@ def is_rate_limit_error(error_text: str) -> bool:
 def error_frame_is_rate_limit(frame: ErrorFrame) -> bool:
     """Real, typed rate-limit check - prefers this over string matching.
 
-    Groq's client is OpenAI-compatible (confirmed directly: GroqLLMService
-    raises openai.RateLimitError under the hood), and that exception class
-    carries a reliable class-level `status_code = 429` (confirmed in the
-    installed openai package's _exceptions.py) - a genuine signal, not a
-    guess based on what the error message happens to say. Also confirmed
-    directly in pipecat's source (services/openai/base_llm.py and
-    services/llm_service.py) that both the normal chat-completion path and
-    the background context-summarization path call push_error(...,
-    exception=e), so frame.exception is populated in both cases this
-    pipeline actually hits.
+    Groq's client is OpenAI-compatible, so GroqLLMService raises
+    openai.RateLimitError under the hood - a class with a reliable
+    class-level `status_code = 429` (see the installed openai package's
+    _exceptions.py), a genuine signal rather than a guess based on what the
+    error message happens to say. Both the normal chat-completion path and
+    the background context-summarization path (pipecat's
+    services/openai/base_llm.py and services/llm_service.py) call
+    push_error(..., exception=e), so frame.exception is populated in both
+    cases this pipeline actually hits.
 
     Falls back to the text heuristic (is_rate_limit_error) only when
     frame.exception is None - some other pipecat-internal path might push
@@ -250,16 +248,13 @@ def is_background_summarization_error(error_text: str) -> bool:
     """True if `error_text` (lowercased) came from pipecat's own background
     context-summarization feature, not a real user-facing turn.
 
-    Confirmed directly against pipecat's installed source
-    (pipecat/services/llm_service.py) that its two failure paths for this
-    feature use these exact, stable, library-authored prefixes:
+    Matches the exact, stable, library-authored prefixes pipecat's
+    services/llm_service.py uses for this feature's two failure paths:
     "Error generating context summary: ..." and "Context summarization
     timed out after {N}s". A summarization failure has nothing to do with
-    whatever the user actually asked in their current turn - showing them
-    a "sorry, glitch" apology and spending the circuit breaker's budget on
-    a background job that failed is a false alarm. Confirmed live
-    (session log, 2026-07-27 ~11:13): a summarization rate limit produced
-    exactly this misleading apology for a turn that itself succeeded fine.
+    whatever the user actually asked in their current turn - showing them a
+    "sorry, glitch" apology and spending the circuit breaker's budget on a
+    background job that failed would be a false alarm.
     """
     return error_text.startswith("error generating context summary") or error_text.startswith(
         "context summarization timed out"
@@ -510,16 +505,14 @@ def resolve_topic_slug(topic: str, page_slugs: dict[str, str]) -> str | None:
 
     Tries an exact key match first, then falls back to a loose substring
     match in either direction - handles near-misses like "civics" or "the
-    hrv model" without needing an exact dict key. The `topic` enum on the
-    tool schema (see make_browse_page_tool) now strongly biases the model
-    toward emitting a real key verbatim, but this loose fallback stays as
-    defense-in-depth for whatever a model emits anyway.
+    hrv model" without needing an exact dict key. Defense-in-depth for
+    whatever a model emits anyway; the tool schema's `topic` enum (see
+    make_browse_page_tool) is the primary safeguard now.
 
-    Extracted out of make_browse_page_tool's handler closure specifically
-    so it's a plain, synchronous function - directly unit-testable (see
-    tests/test_bot.py) without needing pipecat, network I/O, or async
-    plumbing. This is also the exact function used to measure the 30%
-    real-world hit rate that motivated adding the schema enum.
+    A plain, synchronous, module-level function (not a closure inside
+    make_browse_page_tool's handler) specifically so it's directly
+    unit-testable (see tests/test_bot.py) without pipecat, network I/O, or
+    async plumbing.
     """
     slug = page_slugs.get(topic)
     if slug is not None:
@@ -619,16 +612,17 @@ def make_browse_page_tool(
         await params.result_callback({"topic": topic, "found": True, "page_content": text})
 
     # Constrains the model to a closed set of valid topics via JSON Schema
-    # `enum`, instead of letting it free-generate a phrase and hoping the
-    # fuzzy substring match below happens to recognize it. Measured directly
-    # against real topics an LLM sent in this pipeline before this change
-    # (e.g. "honda pakistan best selling models", "compare with other
-    # brands") - only 3 of 10 resolved to a real page; the rest returned a
-    # miss plus a dump of every valid topic back into context, which is
-    # exactly the kind of wasted round-trip that eats into rate limits. The
-    # loose substring match is kept as a safety net below, not removed -
-    # enum strongly biases well-behaved models but isn't a hard grammar
-    # constraint, so a model could still emit something off-list.
+    # `enum`, instead of letting it free-generate a phrase and hoping
+    # resolve_topic_slug's fuzzy substring match happens to recognize it.
+    # Measured directly against real topics an LLM sent in this pipeline
+    # before this change (e.g. "honda pakistan best selling models",
+    # "compare with other brands") - only 3 of 10 resolved to a real page;
+    # the rest returned a miss plus a dump of every valid topic back into
+    # context, which is exactly the kind of wasted round-trip that eats
+    # into rate limits. resolve_topic_slug's loose substring match is kept
+    # as a safety net, not removed - enum strongly biases well-behaved
+    # models but isn't a hard grammar constraint, so a model could still
+    # emit something off-list.
     valid_topics = sorted(set(page_slugs.keys()))
 
     return FunctionSchema(
@@ -873,38 +867,24 @@ class TextSanitizer(FrameProcessor):
 
     Known limitation: operates per-fragment, since RTVI streams one
     "bot-llm-text" message per raw LLM token chunk rather than per complete
-    sentence (confirmed directly in pipecat's
-    RTVIObserver._handle_llm_text_frame - every LLMTextFrame is pushed to
-    the client immediately, unaggregated). Buffering into complete
-    sentences first (like the audio variant's TTSTextNormalizer does) would
-    add latency before any text reaches the client at all, defeating
-    real-time streaming - a tag split exactly across two separate streamed
-    fragments could theoretically slip through partially. A narrow, accepted
-    trade-off for keeping streaming immediate.
+    sentence (every LLMTextFrame is pushed to the client immediately,
+    unaggregated - see pipecat's RTVIObserver._handle_llm_text_frame).
+    Buffering into complete sentences first (like the audio variant's
+    TTSTextNormalizer does) would add latency before any text reaches the
+    client at all, defeating real-time streaming - a tag split exactly
+    across two separate streamed fragments could theoretically slip through
+    partially. A narrow, accepted trade-off for keeping streaming immediate.
 
-    BUG FOUND AND FIXED (confirmed via live testing, not just code reading):
-    every reply was rendered twice, interleaved word-by-word, in the web
-    client (client/index.html) - e.g. "TheThe comparison between Honda and
-    MG can be done by looking at the comparison between...". The bot's own
-    logged final answer (assistant_aggregator's aggregated message.content)
-    was clean, proving the LLM only generated the text once - the
-    duplication was happening between the pipeline and the client.
-    Root cause, traced directly in the installed pipecat source: pipecat's
-    RTVIObserver dedupes frames it has already reported via `frame.id in
-    self._frames_seen` (pipecat/processors/frameworks/rtvi/observer.py).
-    `Frame.id` is auto-assigned in `__post_init__` and is NOT preserved by
-    `dataclasses.replace()` - replace() re-runs __init__/__post_init__, so
-    it mints a brand-new id even when only `text` changed. This processor
-    used to always call `dataclasses.replace(frame, text=sanitized)`, so
-    every single LLMTextFrame chunk got a fresh id here and the observer
-    (which also sees the frame at this exact processor-to-processor hop,
-    per pipecat's push_frame/on_push_frame wiring) treated it as a brand
-    new, distinct frame - sending a second "bot-llm-text" RTVI message for
-    every chunk, on top of the one already sent when `llm` first pushed it.
-    Fixed by mutating `frame.text` in place instead: `Frame` is a plain
-    (non-frozen) dataclass, so this is safe, and it keeps the frame's
-    original id intact in every case - including the actual tag-stripping
-    case, which used to still trigger this if it had ever fired for real.
+    Mutates `frame.text` in place rather than replacing the frame - `Frame`
+    is a plain (non-frozen) dataclass, so this is safe, and it matters here
+    specifically: pipecat's RTVIObserver dedupes frames by `frame.id`,
+    which is auto-assigned in `__post_init__` and NOT preserved by
+    `dataclasses.replace()` (replace() reruns __init__, minting a fresh id
+    even when only `text` changed). Replacing the frame here previously
+    caused every streamed chunk to reach the client twice - once when `llm`
+    pushed the original frame, again when this processor pushed a
+    replacement whose new id the observer's dedup logic couldn't recognize
+    as the same frame.
     """
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -965,17 +945,14 @@ async def _push_standalone_text_message(worker: PipelineWorker, text: str) -> No
     """Pushes a one-shot bot text message (greeting/fallback) with proper
     started/stopped bookends, not just the bare text.
 
-    Bug found via comprehensive testing: pushing only a bare BotLLMTextMessage
-    (no surrounding lifecycle messages) means a client tracking "is the bot
-    currently responding" via the standard bot-llm-started/bot-llm-stopped
-    pair never gets told this one finished - confirmed directly that
-    bot-llm-stopped is only emitted by pipecat's RTVI observer in response to
-    a real LLMFullResponseEndFrame, which never occurs for a message pushed
-    this way. A client's "bot is typing..." state could get stuck forever
-    after every greeting or fallback apology. Same root-cause class as the
-    audio variant's TTSStartedFrame/TTSStoppedFrame fix for its fallback
-    audio - a raw content frame/message needs its matching lifecycle
-    bookends, not just the content itself.
+    A bare BotLLMTextMessage with no surrounding lifecycle messages leaves
+    a client stuck showing "bot is typing..." forever: bot-llm-stopped is
+    only emitted by pipecat's RTVI observer in response to a real
+    LLMFullResponseEndFrame, which never occurs for a message pushed this
+    way. Same root-cause class as the audio variant's
+    TTSStartedFrame/TTSStoppedFrame fix for its fallback audio - a raw
+    content frame/message needs its matching lifecycle bookends, not just
+    the content itself.
     """
     await worker.rtvi.push_transport_message(BotLLMStartedMessage())
     await worker.rtvi.push_transport_message(BotLLMTextMessage(data=TextMessageData(text=text)))
@@ -983,17 +960,13 @@ async def _push_standalone_text_message(worker: PipelineWorker, text: str) -> No
 
 
 async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
-    # whisper-large-v3-turbo instead of whisper-large-v3: measured directly
-    # in this exact pipeline (same conversation, same real audio, only the
-    # model swapped) - STT TTFB dropped from ~3s to ~0.3-0.5s, a 6-10x cut,
-    # since every utterance already pays for two concurrent transcription
-    # calls (see BilingualGroqSTTService). Re-verified the Urdu-bias
-    # threshold tuning still holds afterward (the "Wait, stop, never mind."
-    # case that used to be borderline still resolved to English, with a
-    # wider confidence margin than before, if anything). Known trade-off,
-    # not fully exercised here: Whisper's turbo variants are documented to
-    # trade a little accuracy for speed, more noticeably on less-common
-    # languages/accents than clean English.
+    # whisper-large-v3-turbo instead of whisper-large-v3: cuts STT TTFB
+    # from ~3s to ~0.3-0.5s (a 6-10x reduction), which matters more here
+    # than usual since every utterance already pays for two concurrent
+    # transcription calls (see BilingualGroqSTTService). Known trade-off:
+    # Whisper's turbo variants are documented to trade a little accuracy
+    # for speed, more noticeably on less-common languages/accents than
+    # clean English.
     stt = BilingualGroqSTTService(
         api_key=os.environ["GROQ_API_KEY"],
         settings=GroqSTTService.Settings(model="whisper-large-v3-turbo"),
@@ -1086,15 +1059,11 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         circuit_open_until = 0.0
 
         if message.interrupted:
-            # Confirmed problem #9 (ported from the audio variant): the
-            # bot's memory of an interrupted response didn't match what the
-            # user actually got. Real audio-driven testing on the audio
-            # variant found message.content comes back empty on interruption
-            # - pipecat doesn't broadcast any assistant entry into context
-            # at all in that case, which is silent data loss (the LLM has
-            # zero memory it started answering) rather than the originally
-            # suspected fabricated-full-text case. Handles both: replaces
-            # the entry if pipecat did broadcast one, otherwise appends an
+            # On interruption, message.content usually comes back empty -
+            # pipecat doesn't broadcast any assistant entry into context at
+            # all in that case, which is silent data loss (the LLM has zero
+            # memory it started answering). Handles both cases: replaces the
+            # entry if pipecat did broadcast one, otherwise appends an
             # honest interruption marker instead of silently losing the turn.
             original_content = message.content
 
@@ -1154,11 +1123,10 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         idle_timeout_secs=300.0,
     )
 
-    # Confirmed problem #7 (ported from the audio variant): a flat
-    # per-attempt cooldown still lets the fallback fire indefinitely during
-    # a genuine outage (every FALLBACK_COOLDOWN_SECS, forever). This is a
-    # real circuit breaker instead: each consecutive failure doubles how
-    # long the circuit stays open (backoff grows 5s -> 10s -> 20s -> ...
+    # A flat per-attempt cooldown would let the fallback fire indefinitely
+    # during a genuine outage (every FALLBACK_COOLDOWN_SECS, forever). This
+    # is a real circuit breaker instead: each consecutive failure doubles
+    # how long the circuit stays open (backoff grows 5s -> 10s -> 20s ...
     # capped at CIRCUIT_BREAKER_MAX_BACKOFF_SECS), and a single successful
     # turn (on_assistant_turn_stopped above) closes it again completely.
     consecutive_fallback_failures = 0
@@ -1231,14 +1199,10 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
             )
             _schedule_model_fallback_reset()
 
-        # Confirmed live (session log, 2026-07-27 ~11:13): a failure in
-        # pipecat's own background context-summarization pass previously
-        # still triggered the same "Sorry, I hit a glitch" apology and
-        # counted against the circuit breaker below - even though nothing
-        # about the user's actual, current turn failed. That's a false
-        # alarm from the user's point of view, not a real reply failure -
-        # log it and stop here rather than apologizing for something that
-        # didn't happen.
+        # A failure in pipecat's own background context-summarization pass
+        # has nothing to do with the user's actual, current turn - showing
+        # an apology and spending the circuit breaker's budget on it would
+        # be a false alarm. Log it and stop here instead.
         error_text = str(frame.error).lower()
         if is_background_summarization_error(error_text):
             logger.warning(
@@ -1315,17 +1279,13 @@ async def bot(runner_args: RunnerArguments):
             webrtc_connection=runner_args.webrtc_connection,
             params=TransportParams(
                 audio_in_enabled=True,
-                # Bug found via comprehensive testing: audio_out_enabled=False
-                # (the semantically "correct" choice, since this variant has
-                # no TTS at all) silently breaks the RTVI observer's
-                # user-started-speaking/interruption event forwarding to the
-                # client - confirmed directly (A/B tested in eval mode): with
-                # this False, "user_started_speaking" never reached the
-                # client despite the bot's own internal VAD/turn-detection
-                # correctly firing; flipping it to True fixed it immediately,
-                # no other change. No TTS service exists anywhere in this
-                # pipeline to actually generate audio, so this is a free fix,
-                # not a real audio-output enablement.
+                # Must be True even though this variant has no TTS: with it
+                # False, the RTVI observer silently stops forwarding
+                # user-started-speaking/interruption events to the client at
+                # all, despite the bot's own internal VAD/turn-detection
+                # firing correctly server-side. No TTS service exists
+                # anywhere in this pipeline to actually generate audio, so
+                # this is a free fix, not a real audio-output enablement.
                 audio_out_enabled=True,
             ),
         )
@@ -1395,12 +1355,12 @@ def _check_port_available(host: str, port: int) -> None:
     "ready" message and only fails later. Checking here, before handing
     off to pipecat's runner at all, avoids that misleading sequence.
 
-    Checks every address `host` resolves to, not just IPv4. Confirmed live:
-    "localhost" (the default) resolves to both 127.0.0.1 and ::1, and a
-    stale process was found listening on ::1 ONLY - an IPv4-only check
-    here passed clean while uvicorn still failed to bind for real moments
-    later, reproducing exactly the misleading "Bot ready!"-then-fail
-    sequence this function exists to prevent in the first place.
+    Checks every address `host` resolves to, not just IPv4 - "localhost"
+    (the default) resolves to both 127.0.0.1 and ::1, and a process
+    listening on ::1 only would otherwise pass this check clean while
+    uvicorn still fails to bind for real moments later, reproducing the
+    exact misleading "Bot ready!"-then-fail sequence this function exists
+    to prevent in the first place.
     """
     import socket
 
