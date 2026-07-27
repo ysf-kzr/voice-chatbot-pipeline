@@ -1,17 +1,36 @@
 #!/usr/bin/env bash
-# Runs every eval scenario in evals/ against a FRESH bot.py process each
-# time (running multiple scenarios against one long-lived process has
-# caused real problems before - e.g. Kokoro TTS silently stopped firing
-# after several turns, and the eval harness's own event-matching gets
-# confused by leftover state from a previous scenario). Restarting fresh
-# per scenario trades a bit of wall-clock time for actually trustworthy
+# Runs eval scenarios in evals/ against a FRESH bot.py process each time
+# (running multiple scenarios against one long-lived process has caused
+# real problems before - e.g. Kokoro TTS silently stopped firing after
+# several turns, and the eval harness's own event-matching gets confused
+# by leftover state from a previous scenario). Restarting fresh per
+# scenario trades a bit of wall-clock time for actually trustworthy
 # results.
 #
-# Usage:
-#   scripts/run_all_evals.sh              # run every scenario in evals/
-#   scripts/run_all_evals.sh foo bar       # run only evals/foo.yaml, evals/bar.yaml
+# Every scenario makes REAL Groq API calls (no mocking) - each completion
+# call costs ~1000 prompt tokens just from the system prompt + the 3
+# advertised tool schemas, before any conversation content. Groq's free
+# tier has a 100,000-tokens-PER-DAY cap shared across everything on the
+# same key (this whole project's manual testing, not just evals) - running
+# every scenario on every dev-loop iteration burns through that fast.
 #
-# Exit code is 0 only if every scenario passed.
+# So by default, this only runs the QUICK tier: scenarios that make one
+# cheap completion call each, no tool-calling round-trips (which double
+# the cost per turn: one call to decide to call the tool, a second to
+# turn the result into a reply) and no deliberately long "explain in
+# detail" completions. The FULL tier - browse_honda_test,
+# interrupted_context_test, thrashing_test, tool_calling_test - covers
+# real tool-calling and long-response interruption specifically, and
+# costs meaningfully more per run; run it deliberately, not on every loop.
+#
+# Usage:
+#   scripts/run_all_evals.sh              # QUICK tier only (cheap, default)
+#   scripts/run_all_evals.sh --full       # every scenario in evals/
+#   scripts/run_all_evals.sh foo bar      # only evals/foo.yaml, evals/bar.yaml
+#                                         # (explicit names always run
+#                                         #  regardless of tier)
+#
+# Exit code is 0 only if every scenario that ran passed.
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
@@ -22,14 +41,34 @@ PORT=7860
 LOG_DIR="eval_logs"
 mkdir -p "$LOG_DIR"
 
-if [ "$#" -gt 0 ]; then
+# Tool-calling scenarios pay for a second completion per turn (initial
+# call -> tool call -> second call to turn the result into a reply), and
+# the "in detail"/"in great detail" prompts are deliberately long so
+# there's a real window to interrupt into - both cost noticeably more
+# than the rest of the suite's short, single-completion turns.
+FULL_TIER_ONLY="browse_honda_test interrupted_context_test thrashing_test tool_calling_test"
+
+if [ "$#" -gt 0 ] && [ "$1" != "--full" ]; then
     SCENARIOS=()
     for name in "$@"; do
         SCENARIOS+=("evals/${name}.yaml")
     done
-else
+elif [ "${1:-}" = "--full" ]; then
     SCENARIOS=(evals/*.yaml)
+else
+    SCENARIOS=()
+    for f in evals/*.yaml; do
+        name=$(basename "$f" .yaml)
+        if [[ " $FULL_TIER_ONLY " != *" $name "* ]]; then
+            SCENARIOS+=("$f")
+        fi
+    done
+    RAN_QUICK_TIER_DEFAULT=1
+    echo "Running the QUICK tier (cheap, default) - use --full for every scenario."
+    echo "Skipped (full tier only): $FULL_TIER_ONLY"
+    echo ""
 fi
+RAN_QUICK_TIER_DEFAULT="${RAN_QUICK_TIER_DEFAULT:-0}"
 
 declare -A RESULTS
 declare -A DURATIONS
@@ -187,6 +226,9 @@ for scenario in "${SCENARIOS[@]}"; do
 done
 echo "--------------------------------------------------"
 echo "$pass passed, $fail failed, $skip skipped"
+if [ "$RAN_QUICK_TIER_DEFAULT" -eq 1 ]; then
+    echo "(quick tier only - run with --full to also cover: $FULL_TIER_ONLY)"
+fi
 echo "Logs: $LOG_DIR/"
 
 if [ "$fail" -gt 0 ]; then
