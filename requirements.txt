@@ -6,6 +6,10 @@ python-dotenv==1.2.2
 beautifulsoup4==4.15.0
 curl_cffi==0.15.0
 PyAudio==0.2.14
+# openai is a transitive dep of pipecat-ai[groq] (Groq's client is
+# OpenAI-compatible) - pinned explicitly here too since bot.py now imports
+# it directly (openai.RateLimitError, for a real typed rate-limit check).
+openai==2.44.0
 
 # Dev/test only - not needed to run bot.py itself.
 pytest==9.1.1

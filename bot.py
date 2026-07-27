@@ -34,6 +34,7 @@ import re
 import sys
 import time
 
+import openai
 import pyaudio
 from bs4 import BeautifulSoup
 from curl_cffi import requests as curl_requests
@@ -197,19 +198,73 @@ LLM_MODEL_FALLBACK_CHAIN = [
 
 
 def is_rate_limit_error(error_text: str) -> bool:
-    """Heuristic rate-limit detector: substring match on the lowercased
-    error text, since GroqLLMService/the underlying Groq client don't
-    expose a typed rate-limit exception class here.
+    """Fallback heuristic rate-limit detector: substring match on the
+    lowercased error text. NOT the primary check anymore - see
+    error_frame_is_rate_limit below, which checks a real, typed exception
+    first and only falls back to this when no exception object is
+    available at all.
 
     Known limitation, not fixed here: "429" is checked as a bare substring,
     so it could false-positive on an unrelated number that happens to
     contain those digits elsewhere in the error text (a token count, a
-    request id). Extracted into its own pure function specifically so this
-    behavior - including that known weakness - is unit-tested (see
-    tests/test_bot.py) rather than only exercised indirectly via a live
-    rate limit.
+    request id) - error_frame_is_rate_limit's typed check avoids exactly
+    this for the normal case; this text-only fallback keeps the weakness
+    for the rarer case where no exception object made it through. Kept as
+    its own pure function so this behavior - including that known
+    weakness - is unit-tested (see tests/test_bot.py) rather than only
+    exercised indirectly via a live rate limit.
     """
     return "rate_limit" in error_text or "429" in error_text or "rate limit" in error_text
+
+
+def error_frame_is_rate_limit(frame: ErrorFrame) -> bool:
+    """Real, typed rate-limit check - prefers this over string matching.
+
+    Groq's client is OpenAI-compatible (confirmed directly: GroqLLMService
+    raises openai.RateLimitError under the hood), and that exception class
+    carries a reliable class-level `status_code = 429` (confirmed in the
+    installed openai package's _exceptions.py) - a genuine signal, not a
+    guess based on what the error message happens to say. Also confirmed
+    directly in pipecat's source (services/openai/base_llm.py and
+    services/llm_service.py) that both the normal chat-completion path and
+    the background context-summarization path call push_error(...,
+    exception=e), so frame.exception is populated in both cases this
+    pipeline actually hits.
+
+    Falls back to the text heuristic (is_rate_limit_error) only when
+    frame.exception is None - some other pipecat-internal path might push
+    an ErrorFrame without one. If exception IS present but isn't a
+    RateLimitError, that's authoritative and trusted over the text
+    heuristic, not just an additional vote - a non-rate-limit exception
+    whose str() happens to contain "429" shouldn't be miscounted just
+    because the text check alone would have said yes.
+    """
+    if isinstance(frame.exception, openai.RateLimitError):
+        return True
+    if frame.exception is not None:
+        return False
+    return is_rate_limit_error(str(frame.error).lower())
+
+
+def is_background_summarization_error(error_text: str) -> bool:
+    """True if `error_text` (lowercased) came from pipecat's own background
+    context-summarization feature, not a real user-facing turn.
+
+    Confirmed directly against pipecat's installed source
+    (pipecat/services/llm_service.py) that its two failure paths for this
+    feature use these exact, stable, library-authored prefixes:
+    "Error generating context summary: ..." and "Context summarization
+    timed out after {N}s". A summarization failure has nothing to do with
+    whatever the user actually asked in their current turn - showing them
+    a "sorry, glitch" apology and spending the circuit breaker's budget on
+    a background job that failed is a false alarm. Confirmed live
+    (session log, 2026-07-27 ~11:13): a summarization rate limit produced
+    exactly this misleading apology for a turn that itself succeeded fine.
+    """
+    return error_text.startswith("error generating context summary") or error_text.startswith(
+        "context summarization timed out"
+    )
+
 
 # Worked example of tool calling against a REAL website (not fake/hardcoded
 # data): honda.com.pk's homepage includes a mega-menu block, present on
@@ -989,6 +1044,24 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         assistant_params=LLMAssistantAggregatorParams(enable_auto_context_summarization=True),
     )
 
+    # Fire-and-forget background tasks (currently just
+    # _correct_interrupted_context below) need a live reference kept
+    # somewhere for their whole lifetime - asyncio.create_task() alone
+    # doesn't do that. Per CPython's own asyncio docs: "Save a reference
+    # to the result, to avoid a task disappearing mid-execution" - nothing
+    # else holds one, so the task object is only kept alive by whatever
+    # asyncio.create_task() returns, which is otherwise unreferenced and
+    # eligible for garbage collection before it finishes running. The
+    # done-callback discards each task from this set once it completes, so
+    # this doesn't grow unbounded over a long conversation.
+    background_tasks: set[asyncio.Task] = set()
+
+    def _track_background_task(coro) -> asyncio.Task:
+        task = asyncio.create_task(coro)
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+        return task
+
     @user_aggregator.event_handler("on_user_turn_message_added")
     async def on_user_turn_message_added(aggregator, message):
         logger.log("CONVO", f"User: {message.content}")
@@ -1047,7 +1120,7 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
                 context.set_messages(messages)
                 logger.debug("Recorded interruption marker for empty-content assistant turn")
 
-            asyncio.create_task(_correct_interrupted_context())
+            _track_background_task(_correct_interrupted_context())
 
     text_sanitizer = TextSanitizer()
 
@@ -1120,7 +1193,15 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         # the reset further out, not race two resets against each other.
         if model_fallback_reset_task and not model_fallback_reset_task.done():
             model_fallback_reset_task.cancel()
-        model_fallback_reset_task = asyncio.create_task(_reset_after_delay())
+        # Tracked (not bare asyncio.create_task) for the same reason as
+        # _correct_interrupted_context above, plus this one specifically
+        # needs cancelling on pipeline shutdown (see on_pipeline_finished
+        # below) - each connection has its own `llm` instance, so a leaked
+        # task here can't affect a different connection, but a 600s sleep
+        # left running past its own connection's end is still a real task
+        # (and closed-over llm/context object) leak with no one left to
+        # observe its effect.
+        model_fallback_reset_task = _track_background_task(_reset_after_delay())
 
     @worker.event_handler("on_pipeline_error")
     async def on_pipeline_error(worker, frame: ErrorFrame):
@@ -1134,9 +1215,12 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         # for nothing if that model's quota is genuinely exhausted for the
         # window. Moving to the next model in the fallback chain means the
         # very next turn has a real chance of succeeding, not just a slower
-        # retry of the thing that already failed.
-        error_text = str(frame.error).lower()
-        if is_rate_limit_error(error_text) and current_model_index + 1 < len(LLM_MODEL_FALLBACK_CHAIN):
+        # retry of the thing that already failed. Applies regardless of
+        # whether THIS particular error came from a real turn or the
+        # background summarizer below - a rate limit is org-wide, so
+        # either origin is equally good evidence the current model is
+        # (temporarily) exhausted.
+        if error_frame_is_rate_limit(frame) and current_model_index + 1 < len(LLM_MODEL_FALLBACK_CHAIN):
             previous_model = LLM_MODEL_FALLBACK_CHAIN[current_model_index]
             current_model_index += 1
             next_model = LLM_MODEL_FALLBACK_CHAIN[current_model_index]
@@ -1146,6 +1230,22 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
                 f"model to {next_model!r} for subsequent turns."
             )
             _schedule_model_fallback_reset()
+
+        # Confirmed live (session log, 2026-07-27 ~11:13): a failure in
+        # pipecat's own background context-summarization pass previously
+        # still triggered the same "Sorry, I hit a glitch" apology and
+        # counted against the circuit breaker below - even though nothing
+        # about the user's actual, current turn failed. That's a false
+        # alarm from the user's point of view, not a real reply failure -
+        # log it and stop here rather than apologizing for something that
+        # didn't happen.
+        error_text = str(frame.error).lower()
+        if is_background_summarization_error(error_text):
+            logger.warning(
+                "Background context-summarization error - not shown to the "
+                "user, since their actual turn wasn't affected."
+            )
+            return
 
         now = time.monotonic()
         if now < circuit_open_until:
@@ -1185,6 +1285,18 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         logger.log("CONVO", f"Bot: {GREETING_MESSAGE}")
         _print_chat("Bot", GREETING_MESSAGE)
         await _push_standalone_text_message(worker, GREETING_MESSAGE)
+
+    @worker.event_handler("on_pipeline_finished")
+    async def cancel_background_tasks(worker, frame):
+        # Cancels every tracked background task (interrupted-context
+        # corrections, the model-fallback reset timer) once this
+        # connection's pipeline reaches any terminal state - without this,
+        # a still-sleeping model_fallback_reset_task (up to 600s) would
+        # keep running, and being referenced, well past the point anyone
+        # could still observe or care about its effect.
+        for task in list(background_tasks):
+            if not task.done():
+                task.cancel()
 
     runner = WorkerRunner(handle_sigint=handle_sigint)
     await runner.add_workers(worker)
@@ -1282,17 +1394,30 @@ def _check_port_available(host: str, port: int) -> None:
     second instance started against an already-used port prints a false
     "ready" message and only fails later. Checking here, before handing
     off to pipecat's runner at all, avoids that misleading sequence.
+
+    Checks every address `host` resolves to, not just IPv4. Confirmed live:
+    "localhost" (the default) resolves to both 127.0.0.1 and ::1, and a
+    stale process was found listening on ::1 ONLY - an IPv4-only check
+    here passed clean while uvicorn still failed to bind for real moments
+    later, reproducing exactly the misleading "Bot ready!"-then-fail
+    sequence this function exists to prevent in the first place.
     """
     import socket
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+    try:
+        addrinfos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as e:
+        sys.exit(f"Could not resolve host {host!r}: {e}")
+
+    for family, socktype, proto, _canonname, sockaddr in addrinfos:
         try:
-            s.bind((host, port))
-        except OSError:
+            with socket.socket(family, socktype, proto) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+                s.bind(sockaddr)
+        except OSError as e:
             sys.exit(
-                f"Port {port} on {host} is already in use - is another "
-                f"instance of this bot already running?"
+                f"Port {port} on {sockaddr[0]} is already in use - is "
+                f"another instance of this bot already running? ({e})"
             )
 
 
