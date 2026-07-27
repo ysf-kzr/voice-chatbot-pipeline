@@ -247,6 +247,20 @@ class TestIsBackgroundSummarizationError:
         assert bot.is_background_summarization_error("connection timed out") is False
 
 
+class TestIsToolCallFailedError:
+    def test_detects_the_real_groq_message(self):
+        # Verbatim (lowercased) text captured live from a real Groq
+        # response - not a synthetic example.
+        text = "error during completion: failed to call a function. please adjust your prompt. see 'failed_generation' for more details."
+        assert bot.is_tool_call_failed_error(text) is True
+
+    def test_does_not_flag_a_rate_limit_error(self):
+        assert bot.is_tool_call_failed_error("error code: 429 - rate_limit_exceeded") is False
+
+    def test_does_not_flag_an_unrelated_error(self):
+        assert bot.is_tool_call_failed_error("connection timed out") is False
+
+
 class TestLlmModelFallbackChain:
     def test_chain_is_non_empty(self):
         assert len(bot.LLM_MODEL_FALLBACK_CHAIN) >= 1

@@ -43,7 +43,7 @@ from loguru import logger
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import ErrorFrame, Frame, TextFrame
+from pipecat.frames.frames import ErrorFrame, Frame, LLMRunFrame, TextFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -266,6 +266,22 @@ def is_background_summarization_error(error_text: str) -> bool:
     return error_text.startswith("error generating context summary") or error_text.startswith(
         "context summarization timed out"
     )
+
+
+def is_tool_call_failed_error(error_text: str) -> bool:
+    """True if `error_text` (lowercased) is Groq's own tool-call-generation
+    failure message, not a network/rate-limit/other issue.
+
+    Groq occasionally can't get a model to produce a syntactically valid
+    function call for a legitimate tool-calling request and returns this
+    exact message instead of a malformed call: "Failed to call a function.
+    Please adjust your prompt." (confirmed live - a real Honda-contact-info
+    request that should have called browse_honda_page hit this verbatim).
+    Usually a one-off sampling issue: a fresh attempt at the SAME turn
+    (same context, nothing about the user's question changed) often
+    succeeds on retry, unlike a rate limit or a genuine model/tool mismatch.
+    """
+    return "failed to call a function" in error_text
 
 
 # Worked example of tool calling against a REAL website (not fake/hardcoded
@@ -1056,12 +1072,13 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         # flash blank lines instead of masking the wait as intended.
         if message.content:
             _print_chat("Bot", message.content)
-        nonlocal consecutive_fallback_failures, circuit_open_until
+        nonlocal consecutive_fallback_failures, circuit_open_until, tool_call_retry_used
         # A real assistant turn completed successfully - close the circuit
         # breaker below entirely, so a transient blip doesn't leave things
         # backed off longer than necessary once the service has recovered.
         consecutive_fallback_failures = 0
         circuit_open_until = 0.0
+        tool_call_retry_used = False
 
         if message.interrupted:
             # On interruption, message.content usually comes back empty -
@@ -1137,6 +1154,13 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
     consecutive_fallback_failures = 0
     circuit_open_until = 0.0
     CIRCUIT_BREAKER_MAX_BACKOFF_SECS = 60.0
+    # Bounds tool-call-failure retries to one per turn - reset to False
+    # whenever a turn actually completes (on_assistant_turn_stopped above,
+    # same as the circuit breaker state), so a NEW turn always gets its
+    # own retry attempt, but a turn that fails twice in a row (retry
+    # didn't help) falls through to the normal apology instead of retrying
+    # forever.
+    tool_call_retry_used = False
     current_model_index = 0
     # Once a rate limit forces a move off the primary model, nothing was
     # previously moving things back - a fallback model, once switched to,
@@ -1178,9 +1202,26 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
 
     @worker.event_handler("on_pipeline_error")
     async def on_pipeline_error(worker, frame: ErrorFrame):
-        nonlocal consecutive_fallback_failures, circuit_open_until, current_model_index
+        nonlocal consecutive_fallback_failures, circuit_open_until, current_model_index, tool_call_retry_used
         logger.error(f"Pipeline error from {frame.processor}: {frame.error}")
         if frame.fatal:
+            return
+
+        error_text = str(frame.error).lower()
+
+        # Groq occasionally fails to produce a valid tool call for a
+        # legitimate request ("Failed to call a function") - a one-off
+        # sampling issue, not a real problem with the user's question or
+        # the tool schema. Retrying the SAME turn (context is untouched by
+        # a failed completion - the failed attempt was never added to it)
+        # often just succeeds the second time. Bounded to once per turn via
+        # tool_call_retry_used, reset on the next successful turn, so a
+        # question that genuinely keeps failing falls through to the
+        # normal apology instead of retrying forever.
+        if is_tool_call_failed_error(error_text) and not tool_call_retry_used:
+            tool_call_retry_used = True
+            logger.warning("Tool-call generation failed - retrying this turn once.")
+            await worker.queue_frame(LLMRunFrame())
             return
 
         # A rate limit is a distinct failure mode from a transient hiccup -
@@ -1208,7 +1249,6 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         # has nothing to do with the user's actual, current turn - showing
         # an apology and spending the circuit breaker's budget on it would
         # be a false alarm. Log it and stop here instead.
-        error_text = str(frame.error).lower()
         if is_background_summarization_error(error_text):
             logger.warning(
                 "Background context-summarization error - not shown to the "
