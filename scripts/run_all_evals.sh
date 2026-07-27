@@ -84,27 +84,6 @@ wait_for_port() {
     return 0
 }
 
-# bot.py calls load_dotenv(override=True) - a plain exported env var gets
-# clobbered right back to the real .env's value, so a scenario that needs
-# a broken GROQ_API_KEY (stt_failure_test) can't just export one. Hiding
-# .env for that one process's lifetime is the only way to make the
-# override actually stick. Trap guarantees it's restored even if this
-# script is killed mid-run - never leave the real .env missing.
-ENV_HIDDEN=0
-hide_env() {
-    if [ -f .env ]; then
-        mv .env .env.evalrunner.bak
-        ENV_HIDDEN=1
-    fi
-}
-restore_env() {
-    if [ "$ENV_HIDDEN" -eq 1 ] && [ -f .env.evalrunner.bak ]; then
-        mv .env.evalrunner.bak .env
-        ENV_HIDDEN=0
-    fi
-}
-trap restore_env EXIT INT TERM
-
 echo "Running ${#SCENARIOS[@]} scenario(s)..."
 echo ""
 
@@ -120,8 +99,7 @@ for scenario in "${SCENARIOS[@]}"; do
     echo "=== $name ==="
     needs_special_env="${SCENARIO_ENV[$name]:-}"
     if [ -n "$needs_special_env" ]; then
-        echo "  (starting bot with special env: $needs_special_env - hiding real .env for this one process)"
-        hide_env
+        echo "  (starting bot with special env: $needs_special_env)"
     fi
     kill_port
     sleep 1
@@ -139,7 +117,6 @@ for scenario in "${SCENARIOS[@]}"; do
         RESULTS["$name"]="FAIL"
         DURATIONS["$name"]="-"
         kill_port
-        restore_env
         continue
     fi
 
@@ -153,7 +130,6 @@ for scenario in "${SCENARIOS[@]}"; do
     DURATIONS["$name"]="$((end_ts - start_ts))s"
 
     kill_port
-    restore_env
     rm -f ./*.eval.log
     echo ""
     sleep "$INTER_SCENARIO_COOLDOWN"

@@ -69,7 +69,14 @@ from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
 from pipecat.workers.runner import WorkerRunner
 
-load_dotenv(override=True)
+# Not override=True: a real env var the user already set (e.g. `export
+# GROQ_API_KEY=...` for a one-off test) should win over whatever's in
+# .env, not get silently clobbered back to the .env value. .env is a
+# fallback default for local dev, not an authority over the real
+# environment - override=True previously inverted that, which is the
+# entire reason scripts/run_all_evals.sh used to have to physically
+# rename .env out of the way to test a bad key.
+load_dotenv()
 
 if "GROQ_API_KEY" not in os.environ:
     sys.exit("GROQ_API_KEY is missing - add it to your .env file.")
