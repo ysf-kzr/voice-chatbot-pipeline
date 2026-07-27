@@ -618,30 +618,28 @@ def make_browse_page_tool(
         )
         await params.result_callback({"topic": topic, "found": True, "page_content": text})
 
-    # Constrains the model to a closed set of valid topics via JSON Schema
-    # `enum`, instead of letting it free-generate a phrase and hoping
-    # resolve_topic_slug's fuzzy substring match happens to recognize it.
-    # Measured directly against real topics an LLM sent in this pipeline
-    # before this change (e.g. "honda pakistan best selling models",
-    # "compare with other brands") - only 3 of 10 resolved to a real page;
-    # the rest returned a miss plus a dump of every valid topic back into
-    # context, which is exactly the kind of wasted round-trip that eats
-    # into rate limits. resolve_topic_slug's loose substring match is kept
-    # as a safety net, not removed - enum strongly biases well-behaved
-    # models but isn't a hard grammar constraint, so a model could still
-    # emit something off-list.
-    valid_topics = sorted(set(page_slugs.keys()))
-
+    # DO NOT add a JSON Schema `enum` of valid topics to this property.
+    # It was tried and reverted - measured A/B against the live Groq API
+    # (llama-3.3-70b-versatile, 12 calls per arm, same questions):
+    #
+    #     WITH enum     hard-400 "tool_use_failed" on 10/12  (83%)
+    #     WITHOUT enum  hard-400 on 1/12                     ( 8%)
+    #
+    # The model cannot reliably satisfy a large enum constraint here: it
+    # emits malformed tool-call syntax (observed failed_generation:
+    # `<function=browse_honda_page={"topic":"civic specs"}</function>`,
+    # where "civic specs" is off-enum) and Groq rejects the ENTIRE request
+    # with a 400 rather than passing the off-list value through. That also
+    # means resolve_topic_slug's fuzzy fallback is unreachable in that
+    # case - the request never gets far enough to call this handler at
+    # all, so a near-miss that the fuzzy matcher handles perfectly well
+    # ("civic specs" -> civic-standard) turns into a user-visible error
+    # instead. Free-text + fuzzy resolution resolved 11/12 correctly in
+    # the same test. Keep it that way.
     return FunctionSchema(
         name=tool_name,
         description=description,
-        properties={
-            "topic": {
-                "type": "string",
-                "description": topic_hint,
-                "enum": valid_topics,
-            }
-        },
+        properties={"topic": {"type": "string", "description": topic_hint}},
         required=["topic"],
         handler=handler,
     )

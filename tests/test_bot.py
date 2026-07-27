@@ -109,25 +109,33 @@ class TestResolveTopicSlugRealData:
 
 
 class TestBrowseToolSchemas:
-    """Confirms the `enum` constraint actually landed on the tool schema
-    the LLM sees, and stays in sync with the slug dicts it's derived from -
-    not just that resolve_topic_slug works in isolation.
+    """Regression guard: the browse tools' `topic` argument must stay FREE
+    TEXT, with no JSON Schema `enum` of valid topics.
+
+    An enum was tried and reverted. Measured A/B against the live Groq API
+    (llama-3.3-70b-versatile, 12 calls per arm, identical questions): the
+    enum arm hard-400'd with "tool_use_failed" on 10/12 calls (83%) versus
+    1/12 (8%) without it - the model emits malformed tool-call syntax
+    trying to satisfy the constraint and Groq rejects the whole request,
+    which also makes resolve_topic_slug's fuzzy fallback unreachable. See
+    make_browse_page_tool's comment for the full rationale.
     """
 
-    def test_honda_tool_topic_enum_matches_slug_keys(self):
-        enum_values = set(bot.browse_honda_page_tool.properties["topic"]["enum"])
-        assert enum_values == set(bot.HONDA_PAGE_SLUGS.keys())
+    @pytest.mark.parametrize(
+        "tool",
+        [bot.browse_honda_page_tool, bot.browse_mg_page_tool, bot.honda_price_tool],
+    )
+    def test_no_enum_on_any_tool_argument(self, tool):
+        for arg_name, spec in tool.properties.items():
+            assert "enum" not in spec, (
+                f"{tool.name}.{arg_name} has an enum - this caused an 83% "
+                f"hard-400 rate against Groq. See make_browse_page_tool."
+            )
 
-    def test_mg_tool_topic_enum_matches_slug_keys(self):
-        enum_values = set(bot.browse_mg_page_tool.properties["topic"]["enum"])
-        assert enum_values == set(bot.MG_PAGE_SLUGS.keys())
-
-    def test_honda_price_tool_model_argument_has_no_enum(self):
-        # check_honda_price's "model" argument isn't backed by a static
-        # dict (prices come from a live scrape - see _get_honda_prices),
-        # so it deliberately has no enum. Documents that as intentional,
-        # not an inconsistency with the two tools above.
-        assert "enum" not in bot.honda_price_tool.properties["model"]
+    def test_browse_tools_still_declare_a_free_text_topic_argument(self):
+        for tool in (bot.browse_honda_page_tool, bot.browse_mg_page_tool):
+            assert tool.properties["topic"]["type"] == "string"
+            assert tool.required == ["topic"]
 
 
 class TestHondaPricePattern:
