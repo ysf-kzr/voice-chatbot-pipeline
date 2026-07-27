@@ -63,13 +63,17 @@ Two tiers, fast to slow:
 .venv\Scripts\python.exe -m pytest tests/ -v
 ```
 
-**Evals** (`evals/`) — full pipeline, end-to-end, against a real running `bot.py` with synthesized speech via Kokoro (no human needed, no TTS output needed to run them since this pipeline doesn't use it). Run the whole suite:
+**Evals** (`evals/`) — full pipeline, end-to-end, against a real running `bot.py` with synthesized speech via Kokoro (no human needed, no TTS output needed to run them since this pipeline doesn't use it). These make real Groq API calls, so there are two tiers:
 
 ```
-scripts/run_all_evals.sh
+scripts/run_all_evals.sh            # QUICK tier (default) - 6 cheap, single-completion scenarios
+scripts/run_all_evals.sh --full     # every scenario, including tool-calling and long-response ones
+scripts/run_all_evals.sh foo bar    # only evals/foo.yaml, evals/bar.yaml - runs regardless of tier
 ```
 
-Starts a fresh `bot.py` process per scenario, runs it, tears it down, and prints a pass/fail summary. Pass one or more names to run a subset: `scripts/run_all_evals.sh backchannel_test tool_calling_test`. Bot/eval logs land in `eval_logs/` (gitignored).
+Groq's free tier caps at 100,000 tokens/day shared across everything on the key (manual testing included) — the quick tier exists so a normal dev-loop run doesn't burn through that. Run `--full` deliberately (e.g. before a release), not on every iteration.
+
+Starts a fresh `bot.py` process per scenario, runs it, tears it down, and prints a pass/fail summary. Bot/eval logs land in `eval_logs/` (gitignored).
 
 Some scenarios use a local Ollama judge (`eval:` semantic checks) — if Ollama isn't running, those fail with an `APIConnectionError` unrelated to the bot itself; the summary flags which scenarios that applies to.
 
