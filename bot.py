@@ -195,6 +195,22 @@ LLM_MODEL_FALLBACK_CHAIN = [
     "llama-3.1-8b-instant",
 ]
 
+
+def is_rate_limit_error(error_text: str) -> bool:
+    """Heuristic rate-limit detector: substring match on the lowercased
+    error text, since GroqLLMService/the underlying Groq client don't
+    expose a typed rate-limit exception class here.
+
+    Known limitation, not fixed here: "429" is checked as a bare substring,
+    so it could false-positive on an unrelated number that happens to
+    contain those digits elsewhere in the error text (a token count, a
+    request id). Extracted into its own pure function specifically so this
+    behavior - including that known weakness - is unit-tested (see
+    tests/test_bot.py) rather than only exercised indirectly via a live
+    rate limit.
+    """
+    return "rate_limit" in error_text or "429" in error_text or "rate limit" in error_text
+
 # Worked example of tool calling against a REAL website (not fake/hardcoded
 # data): honda.com.pk's homepage includes a mega-menu block, present on
 # every page, listing each model line's current starting price - e.g.
@@ -434,6 +450,31 @@ def _fetch_and_extract_page_sync(base_url: str, slug: str) -> str:
     return text[:_PAGE_TEXT_MAX_CHARS]
 
 
+def resolve_topic_slug(topic: str, page_slugs: dict[str, str]) -> str | None:
+    """Resolves a (lowercased) topic string to a real page slug.
+
+    Tries an exact key match first, then falls back to a loose substring
+    match in either direction - handles near-misses like "civics" or "the
+    hrv model" without needing an exact dict key. The `topic` enum on the
+    tool schema (see make_browse_page_tool) now strongly biases the model
+    toward emitting a real key verbatim, but this loose fallback stays as
+    defense-in-depth for whatever a model emits anyway.
+
+    Extracted out of make_browse_page_tool's handler closure specifically
+    so it's a plain, synchronous function - directly unit-testable (see
+    tests/test_bot.py) without needing pipecat, network I/O, or async
+    plumbing. This is also the exact function used to measure the 30%
+    real-world hit rate that motivated adding the schema enum.
+    """
+    slug = page_slugs.get(topic)
+    if slug is not None:
+        return slug
+    return next(
+        (s for key, s in page_slugs.items() if key in topic or topic in key),
+        None,
+    )
+
+
 def make_browse_page_tool(
     *,
     tool_name: str,
@@ -458,16 +499,7 @@ def make_browse_page_tool(
 
     async def handler(params: FunctionCallParams):
         topic = str(params.arguments.get("topic", "")).strip().lower()
-        slug = page_slugs.get(topic)
-
-        if slug is None:
-            # Loose fallback: does any known topic phrase appear in what the
-            # model sent, or vice versa? Handles near-misses like "civics"
-            # or "the hrv model" without needing an exact dict key match.
-            slug = next(
-                (s for key, s in page_slugs.items() if key in topic or topic in key),
-                None,
-            )
+        slug = resolve_topic_slug(topic, page_slugs)
 
         if slug is None:
             logger.log("CONVO", f"[tool call] {tool_name}(topic={topic!r}) -> no match")
@@ -1102,12 +1134,9 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         # for nothing if that model's quota is genuinely exhausted for the
         # window. Moving to the next model in the fallback chain means the
         # very next turn has a real chance of succeeding, not just a slower
-        # retry of the thing that already failed. Checked via substring
-        # match on the error text since GroqLLMService/the underlying Groq
-        # client don't expose a typed rate-limit exception class here.
+        # retry of the thing that already failed.
         error_text = str(frame.error).lower()
-        is_rate_limit = "rate_limit" in error_text or "429" in error_text or "rate limit" in error_text
-        if is_rate_limit and current_model_index + 1 < len(LLM_MODEL_FALLBACK_CHAIN):
+        if is_rate_limit_error(error_text) and current_model_index + 1 < len(LLM_MODEL_FALLBACK_CHAIN):
             previous_model = LLM_MODEL_FALLBACK_CHAIN[current_model_index]
             current_model_index += 1
             next_model = LLM_MODEL_FALLBACK_CHAIN[current_model_index]

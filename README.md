@@ -55,7 +55,15 @@ Both tools fall back to a recently-cached result if a live fetch fails, and dist
 
 ## Testing
 
-`evals/` holds automated scenarios (synthesized speech via Kokoro, no human needed, no TTS output needed to run them since this pipeline doesn't use it). Run the whole suite:
+Two tiers, fast to slow:
+
+**Unit tests** (`tests/`) — pure, network-free functions only (topic→slug resolution, the Honda price regex, rate-limit detection, etc.). No API key, no network, no live bot process needed; runs in a couple of seconds:
+
+```
+.venv\Scripts\python.exe -m pytest tests/ -v
+```
+
+**Evals** (`evals/`) — full pipeline, end-to-end, against a real running `bot.py` with synthesized speech via Kokoro (no human needed, no TTS output needed to run them since this pipeline doesn't use it). Run the whole suite:
 
 ```
 scripts/run_all_evals.sh
