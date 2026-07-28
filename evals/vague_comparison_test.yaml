@@ -1,0 +1,32 @@
+name: vague_comparison_test
+
+# Regression test for a real failure seen live: "Compare Honda and MG
+# cars" (no specific models named) caused the bot to pass a vague topic
+# like "models" to the browse tools, which isn't a real page on either
+# site, so both lookups came back empty and it fell back to a generic
+# non-answer instead of an actual comparison. The bot should now default
+# to comparing the Civic and the HS (using real topic names) rather than
+# searching for something that doesn't exist.
+#
+# Run (two terminals):
+#   python bot.py -t eval
+#   pipecat eval run evals/vague_comparison_test.yaml -v
+
+user:
+  modality: audio
+  speech:
+    service: kokoro
+    voice: af_heart
+    sample_rate: 16000
+
+turns:
+  - user: "Compare Honda and MG cars."
+    expect:
+      - event: function_call
+        name: browse_honda_page
+        within_ms: 10000
+      - event: function_call
+        name: browse_mg_page
+        within_ms: 15000
+      - event: llm_response
+        within_ms: 20000
