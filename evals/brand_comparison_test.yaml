@@ -1,0 +1,30 @@
+name: brand_comparison_test
+
+# Verifies the bot actually calls BOTH browse_honda_page and browse_mg_page
+# when asked to compare a Honda model to an MG model, instead of guessing
+# from memory or only fetching one brand's data. Added after the model was
+# never explicitly told it's allowed to use both tools on the same turn -
+# only a system-prompt change, no new tool.
+#
+# Run (two terminals):
+#   python bot.py -t eval
+#   pipecat eval run evals/brand_comparison_test.yaml -v
+
+user:
+  modality: audio
+  speech:
+    service: kokoro
+    voice: af_heart
+    sample_rate: 16000
+
+turns:
+  - user: "Compare the Honda Civic to the MG HS in terms of features."
+    expect:
+      - event: function_call
+        name: browse_honda_page
+        within_ms: 10000
+      - event: function_call
+        name: browse_mg_page
+        within_ms: 15000
+      - event: llm_response
+        within_ms: 20000

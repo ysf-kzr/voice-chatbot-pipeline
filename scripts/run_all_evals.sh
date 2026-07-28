@@ -19,8 +19,9 @@
 # the cost per turn: one call to decide to call the tool, a second to
 # turn the result into a reply) and no deliberately long "explain in
 # detail" completions. The FULL tier - browse_honda_test,
-# interrupted_context_test, thrashing_test, tool_calling_test - covers
-# real tool-calling and long-response interruption specifically, and
+# interrupted_context_test, thrashing_test, tool_calling_test,
+# brand_comparison_test - covers real tool-calling and long-response
+# interruption specifically, and
 # costs meaningfully more per run; run it deliberately, not on every loop.
 #
 # Usage:
@@ -46,7 +47,7 @@ mkdir -p "$LOG_DIR"
 # the "in detail"/"in great detail" prompts are deliberately long so
 # there's a real window to interrupt into - both cost noticeably more
 # than the rest of the suite's short, single-completion turns.
-FULL_TIER_ONLY="browse_honda_test interrupted_context_test thrashing_test tool_calling_test"
+FULL_TIER_ONLY="browse_honda_test interrupted_context_test thrashing_test tool_calling_test brand_comparison_test"
 
 if [ "$#" -gt 0 ] && [ "$1" != "--full" ]; then
     SCENARIOS=()
