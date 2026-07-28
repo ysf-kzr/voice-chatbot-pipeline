@@ -81,12 +81,18 @@ load_dotenv()
 if "GROQ_API_KEY" not in os.environ:
     sys.exit("GROQ_API_KEY is missing - add it to your .env file.")
 
-# Windows consoles default to cp1252, which can't encode Urdu/Arabic script.
-# Reconfigure stderr to UTF-8 before loguru attaches so transcripts print
-# correctly instead of crashing or showing ???.
-if hasattr(sys.stderr, "buffer") and sys.stderr.encoding.lower() != "utf-8":
-    import io
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+# Windows consoles default to cp1252, which can't encode Urdu/Arabic script
+# (or emoji). Reconfigure both streams to UTF-8 before loguru attaches so
+# transcripts print correctly instead of crashing or showing ???. stdout
+# needs it too, not just stderr - pipecat's own startup banner
+# ("\U0001f680 Bot ready!") prints straight to stdout via print(), and
+# crashed the whole process with UnicodeEncodeError on cp1252 before this
+# was added, so the bot never even reached the point of binding the port.
+for _stream_name in ("stdout", "stderr"):
+    _stream = getattr(sys, _stream_name)
+    if hasattr(_stream, "buffer") and _stream.encoding.lower() != "utf-8":
+        import io
+        setattr(sys, _stream_name, io.TextIOWrapper(_stream.buffer, encoding="utf-8", errors="replace"))
 
 logger.remove(0)
 
