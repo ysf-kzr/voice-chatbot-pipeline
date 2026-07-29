@@ -36,8 +36,8 @@
 
     /* A real radius scale applied by role, instead of one blanket value on
        every element (pill-everything is its own tell). */
-    --r-sm: 3px;
-    --r-md: 10px;
+    --r-sm: 8px;
+    --r-md: 16px;
   }
   * { box-sizing: border-box; }
   body {
@@ -58,10 +58,11 @@
   }
   h1 {
     font-family: "Instrument Serif", Georgia, serif;
-    font-size: 1.6rem;
+    font-size: 1.9rem;
     font-weight: 400;
+    line-height: 1.5;
     margin: 0;
-    letter-spacing: -0.01em;
+    letter-spacing: 0.01em;
     color: var(--text);
   }
   /* The dot in "ysf.ai" carries the accent - a small piece of brand character
@@ -140,7 +141,6 @@
     align-self: flex-start;
     background: var(--surface);
     border: 1px solid var(--border);
-    border-left: 2px solid var(--accent);
     border-radius: var(--r-sm) var(--r-md) var(--r-md) var(--r-sm);
   }
   .msg .label {
@@ -524,6 +524,16 @@
     connectBtn.addEventListener("click", async () => {
       connectBtn.disabled = true;
       clearError();
+      // #messages was never cleared between sessions - reconnecting after a
+      // previous session (especially one that got stuck or errored out)
+      // left its whole conversation, including any never-resolved
+      // "Thinking..." bubbles, sitting in the DOM. That looked like a
+      // phantom repeat of old input rather than what it actually was: a
+      // fresh connection starting on top of stale leftover state. Every new
+      // connect attempt now starts from a genuinely blank slate.
+      messagesEl.innerHTML = "";
+      currentBotBubble = null;
+      currentThinkingIndicator = null;
       setStatus("Connecting...", "connecting");
       try {
         await client.connect(); // triggers the mic permission prompt + WebRTC handshake
