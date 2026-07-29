@@ -826,6 +826,22 @@ _ROMAN_URDU_STT_PROMPT = (
     "Yeh gari kitne ki hai? Mehrbani karke dealer ka number bata dein."
 )
 
+# Whisper's `prompt` param doesn't just bias style - on quiet/near-silent
+# audio with little real signal, it can echo the prompt text back
+# verbatim AS the transcription instead of using it purely as a style
+# hint (confirmed live: a real session's "ur" call returned "Mujhe iski
+# qeemat maloom karni hai." - an exact substring of the prompt above -
+# on ambient background noise with no real speech). This scores as
+# perfectly confident (it's real, grammatical Urdu) and reliably wins
+# the bilingual confidence comparison below, so this exact leak would
+# otherwise reach the LLM as if the user had actually said it, every
+# single time the same ambient noise triggered a turn. Since the prompt
+# text is a fixed constant, an echo of it is detectable with high
+# precision - unlike hallucinated text in general, which the project
+# already confirmed can't be distinguished from real speech by
+# confidence score alone.
+_ROMAN_URDU_STT_PROMPT_NORMALIZED = re.sub(r"[.,?!]", "", _ROMAN_URDU_STT_PROMPT.lower())
+
 
 class BilingualGroqSTTService(GroqSTTService):
     """GroqSTTService constrained to a closed set of two languages: English and
@@ -885,6 +901,18 @@ class BilingualGroqSTTService(GroqSTTService):
         winner, lang, conf = (
             (result_en, "en", conf_en) if conf_en >= conf_ur else (result_ur, "ur", conf_ur)
         )
+
+        # See _ROMAN_URDU_STT_PROMPT_NORMALIZED above: catches Whisper
+        # echoing the fixed prompt-bias text back as a "transcription" on
+        # quiet/near-silent audio, before it ever reaches the LLM as if it
+        # were something the user actually said.
+        winner_normalized = re.sub(r"[.,?!]", "", winner.text.strip().lower())
+        if winner_normalized and winner_normalized in _ROMAN_URDU_STT_PROMPT_NORMALIZED:
+            logger.warning(
+                f"STT echoed the Roman-Urdu prompt-bias text back verbatim "
+                f"(no real speech) - dropping: {winner.text!r}"
+            )
+            winner.text = ""
 
         # repr() is ASCII-safe: shows \uXXXX escapes for non-Latin chars so
         # you can spot it immediately if Whisper ever slips back into
