@@ -4,6 +4,11 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>ysf.ai</title>
+<meta name="description" content="A voice assistant you can just talk to. Speaks English and Urdu." />
+<meta name="theme-color" content="#14110d" />
+<!-- Inline SVG data URI rather than a .ico file: keeps the page a single
+     self-contained file with no extra asset to serve or 404 on. -->
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='11' fill='%23c8873f'/></svg>" />
 <!-- Two faces, paired deliberately: Instrument Serif (high-contrast, editorial)
      for the wordmark only, Source Serif 4 for message text. UI chrome (labels,
      buttons, status) stays on a system sans so the serif stays a statement
@@ -25,7 +30,7 @@
      by two competing saturated colors. */
   :root {
     --bg: #14110d;          /* warm near-black */
-    --surface: #1e1a15;     /* raised panel / bot bubble */
+    --surface: #1e1a15;     /* raised panel / assistant bubble */
     --surface-2: #272119;   /* user bubble fill */
     --border: #342c22;      /* hairline rules */
     --text: #ede4d6;        /* warm bone */
@@ -45,16 +50,38 @@
     font-family: system-ui, sans-serif;
     background: var(--bg);
     color: var(--text);
+    /* dvh tracks mobile browser chrome as it shows/hides; vh does not, and
+       leaves the footer clipped below the fold on phones. vh first as the
+       fallback for browsers without dvh. */
     height: 100vh;
+    height: 100dvh;
     display: flex;
     flex-direction: column;
   }
+
+  /* Announced by screen readers, invisible on screen. Used for the
+     per-message speaker labels: the visual design distinguishes speakers by
+     alignment and fill, which conveys nothing to a screen reader, so the
+     label still has to exist in the accessibility tree. */
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
   header {
     padding: 1.1rem 1.75rem;
     border-bottom: 1px solid var(--border);
     display: flex;
     justify-content: space-between;
     align-items: baseline;
+    gap: 1rem;
   }
   h1 {
     font-family: "Instrument Serif", Georgia, serif;
@@ -68,12 +95,20 @@
   /* The dot in "ysf.ai" carries the accent - a small piece of brand character
      that costs nothing and keeps the single-accent rule intact. */
   h1 .dot { color: var(--accent); }
-  .status-wrap { display: flex; align-items: center; gap: 0.5rem; }
+  .status-wrap {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    opacity: 1;
+    transition: opacity 0.25s ease;
+  }
+  /* Nothing to report before the first session - an idle "Disconnected"
+     readout is transport trivia the user has no use for. */
+  .status-wrap[hidden] { display: none; }
   #status {
     color: var(--muted);
     font-size: 0.8rem;
     letter-spacing: 0.04em;
-    text-transform: lowercase;
   }
   .status-dot {
     width: 6px;
@@ -84,14 +119,61 @@
     flex-shrink: 0;
     transition: background-color 0.25s ease, opacity 0.25s ease;
   }
-  .status-dot.connecting,
-  .status-dot.thinking,
-  .status-dot.ready,
-  .status-dot.listening { background: var(--accent); opacity: 1; }
-  .status-dot.connecting,
-  .status-dot.thinking,
-  .status-dot.listening { animation: dot-pulse 1.4s ease-in-out infinite; }
+  .status-dot.busy,
+  .status-dot.live { background: var(--accent); opacity: 1; }
+  .status-dot.busy { animation: dot-pulse 1.4s ease-in-out infinite; }
   .status-dot.error { background: var(--error); opacity: 1; }
+
+  /* First-run screen. A start button isn't just nicer here, it's required:
+     browsers only grant microphone access from a real user gesture, so
+     auto-connecting on load isn't possible. Given the click has to happen,
+     it may as well carry the onboarding. */
+  #welcome {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2rem 1.75rem;
+    overflow-y: auto;
+  }
+  #welcome[hidden] { display: none; }
+  .welcome-inner { max-width: 30rem; text-align: center; }
+  .welcome-tagline {
+    font-family: "Source Serif 4", Georgia, serif;
+    font-size: 1.25rem;
+    line-height: 1.6;
+    color: var(--text);
+    margin: 0 0 2rem;
+  }
+  .examples { margin: 0 0 2rem; }
+  .examples-heading {
+    font-size: 0.68rem;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0 0 0.9rem;
+  }
+  /* Quoted italic lines, deliberately NOT buttons or chips: input here is
+     voice-only, so anything that looks tappable would be a false affordance
+     promising an interaction that doesn't exist. */
+  .example {
+    font-family: "Source Serif 4", Georgia, serif;
+    font-style: italic;
+    font-size: 1rem;
+    line-height: 1.5;
+    color: var(--muted);
+    margin: 0 0 0.5rem;
+  }
+  .example::before { content: "\201C"; }
+  .example::after { content: "\201D"; }
+  .mic-note {
+    font-size: 0.78rem;
+    color: var(--muted);
+    opacity: 0.8;
+    margin: 1rem 0 0;
+  }
+
   #messages {
     flex: 1;
     overflow-y: auto;
@@ -100,15 +182,7 @@
     flex-direction: column;
     gap: 1.1rem;
   }
-  #messages:empty::before {
-    content: "Say something to get started";
-    margin: auto;
-    color: var(--muted);
-    opacity: 0.7;
-    font-family: "Source Serif 4", Georgia, serif;
-    font-size: 1rem;
-    font-style: italic;
-  }
+  #messages[hidden] { display: none; }
   /* Themed scrollbar for the message list - Firefox + WebKit */
   #messages { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
   #messages::-webkit-scrollbar { width: 10px; }
@@ -128,9 +202,10 @@
     font-size: 1.02rem;
     animation: msg-in 0.25s ease;
   }
-  /* Speakers are told apart by alignment + fill weight + one accent rule,
-     rather than by two saturated colors competing for attention. The squared
-     corner points back at whoever is speaking. */
+  /* Speakers are told apart by alignment + fill weight, rather than by
+     printed name labels (no messaging app shows those) or two saturated
+     colors competing for attention. The squared corner points back at
+     whoever is speaking. */
   .msg.you {
     align-self: flex-end;
     background: var(--surface-2);
@@ -143,17 +218,6 @@
     border: 1px solid var(--border);
     border-radius: var(--r-sm) var(--r-md) var(--r-md) var(--r-sm);
   }
-  .msg .label {
-    display: block;
-    font-family: system-ui, sans-serif;
-    font-size: 0.68rem;
-    font-weight: 600;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    margin-bottom: 0.35rem;
-    color: var(--muted);
-  }
-  .msg.bot .label { color: var(--accent); }
   .thinking-indicator {
     display: inline-flex;
     align-items: center;
@@ -202,6 +266,7 @@
     justify-content: center;
     gap: 0.6rem;
   }
+  footer[hidden] { display: none; }
   button {
     background: var(--accent);
     color: var(--accent-ink);
@@ -222,6 +287,7 @@
     outline-offset: 2px;
   }
   button:disabled { opacity: 0.45; cursor: not-allowed; }
+  #startBtn { padding: 0.75rem 2rem; font-size: 0.95rem; }
   button.secondary {
     background: transparent;
     color: var(--muted);
@@ -246,6 +312,7 @@
     background: rgba(180, 80, 63, 0.12);
     color: #e0a596;
     font-size: 0.85rem;
+    line-height: 1.5;
     display: flex;
     justify-content: space-between;
     align-items: center;
@@ -255,11 +322,31 @@
     transition: max-height 0.3s ease, opacity 0.3s ease, padding 0.3s ease;
   }
   #errorBanner.visible {
-    max-height: 6rem;
+    max-height: 9rem;
     opacity: 1;
     padding: 0.7rem 1.75rem;
     border-bottom-color: rgba(180, 80, 63, 0.35);
     border-left-color: var(--error);
+  }
+  .banner-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    flex-shrink: 0;
+  }
+  /* Recovery lives next to the message that explains the problem, so it
+     doesn't depend on the user noticing a control elsewhere on the page. */
+  #errorRetryBtn {
+    background: transparent;
+    border-color: rgba(224, 165, 150, 0.4);
+    color: #e0a596;
+    padding: 0.35rem 0.8rem;
+    font-size: 0.78rem;
+  }
+  #errorRetryBtn:hover:not(:disabled) {
+    background: rgba(180, 80, 63, 0.18);
+    color: var(--text);
+    border-color: rgba(224, 165, 150, 0.7);
   }
   #errorBannerClose {
     background: none;
@@ -274,6 +361,22 @@
     transition: color 0.15s ease;
   }
   #errorBannerClose:hover { color: var(--text); }
+
+  @media (max-width: 640px) {
+    header, footer { padding: 0.9rem 1rem; }
+    #messages { padding: 1.25rem 1rem; gap: 0.9rem; }
+    #welcome { padding: 1.5rem 1rem; }
+    #errorBanner { padding: 0 1rem; }
+    #errorBanner.visible { padding: 0.7rem 1rem; }
+    h1 { font-size: 1.6rem; }
+    .msg { max-width: 85%; font-size: 1rem; }
+    .welcome-tagline { font-size: 1.1rem; }
+    /* 44px is the platform-guideline minimum comfortable tap target; the
+       desktop paddings land well under that on a phone. */
+    button { min-height: 44px; padding: 0.7rem 1.2rem; }
+    #errorRetryBtn { min-height: 36px; }
+    footer { gap: 0.5rem; }
+  }
 
   /* Decorative motion only - the orb/dots/status pulses and the message
      entrance are nice-to-have, never load-bearing, so they come off entirely
@@ -290,23 +393,43 @@
 <body>
   <header>
     <h1>ysf<span class="dot">.</span>ai</h1>
-    <span class="status-wrap">
+    <span class="status-wrap" id="statusWrap" hidden>
       <span id="statusDot" class="status-dot"></span>
-      <span id="status">Disconnected</span>
+      <span id="status"></span>
     </span>
   </header>
 
-  <div id="errorBanner">
+  <div id="errorBanner" role="alert">
     <span id="errorBannerText"></span>
-    <button id="errorBannerClose" aria-label="Dismiss error">&times;</button>
+    <span class="banner-actions">
+      <button id="errorRetryBtn">Try again</button>
+      <button id="errorBannerClose" aria-label="Dismiss message">&times;</button>
+    </span>
   </div>
 
-  <div id="messages"></div>
+  <div id="welcome">
+    <div class="welcome-inner">
+      <p class="welcome-tagline">
+        A voice assistant you can just talk to.<br />
+        Ask in English or Urdu.
+      </p>
+      <div class="examples">
+        <p class="examples-heading">Try saying</p>
+        <p class="example">Explain how a hybrid engine works</p>
+        <p class="example">What does the Honda Civic cost in Pakistan?</p>
+        <p class="example">Compare the Civic and the MG HS</p>
+      </div>
+      <button id="startBtn">Start talking</button>
+      <p class="mic-note">Your browser will ask for microphone access.</p>
+    </div>
+  </div>
 
-  <footer>
-    <button id="connectBtn">Connect &amp; talk</button>
-    <button id="muteBtn" class="secondary" hidden>Mute mic</button>
-    <button id="disconnectBtn" class="secondary" hidden>Disconnect</button>
+  <div id="messages" role="log" aria-live="polite" aria-label="Conversation" hidden></div>
+
+  <footer id="controls" hidden>
+    <button id="muteBtn" class="secondary">Mute</button>
+    <button id="endBtn" class="secondary">End</button>
+    <button id="restartBtn" hidden>Start again</button>
   </footer>
 
   <script type="module">
@@ -334,27 +457,42 @@
     // in the venv: POST here with an SDP offer, get an SDP answer back - this
     // is the same "/api/offer" route the runner sets up regardless of any
     // frontend, so nothing in bot.py needs to change for this page to work).
-    const BOT_OFFER_URL = "http://localhost:7860/api/offer";
+    //
+    // Derived from the page's own origin when it's actually served over
+    // http(s), so deploying this behind the bot needs no edit here. The
+    // localhost fallback covers the local workflow of opening this file
+    // directly from disk (file://), where there is no useful origin.
+    const IS_SERVED = location.protocol === "http:" || location.protocol === "https:";
+    const BOT_OFFER_URL = IS_SERVED
+      ? `${location.origin}/api/offer`
+      : "http://localhost:7860/api/offer";
 
     const messagesEl = document.getElementById("messages");
+    const welcomeEl = document.getElementById("welcome");
+    const statusWrapEl = document.getElementById("statusWrap");
     const statusEl = document.getElementById("status");
     const statusDotEl = document.getElementById("statusDot");
     const errorBannerEl = document.getElementById("errorBanner");
     const errorBannerTextEl = document.getElementById("errorBannerText");
     const errorBannerCloseBtn = document.getElementById("errorBannerClose");
-    const connectBtn = document.getElementById("connectBtn");
+    const errorRetryBtn = document.getElementById("errorRetryBtn");
+    const startBtn = document.getElementById("startBtn");
+    const controlsEl = document.getElementById("controls");
     const muteBtn = document.getElementById("muteBtn");
-    const disconnectBtn = document.getElementById("disconnectBtn");
+    const endBtn = document.getElementById("endBtn");
+    const restartBtn = document.getElementById("restartBtn");
 
     let micEnabled = true;
+    // Distinguishes a user-initiated End from a connection that dropped on
+    // its own, so the two can be explained differently.
+    let endedByUser = false;
 
     function showError(text) {
-      // Text goes into its own child span now, not the banner's
-      // textContent directly - the close button is a sibling element that
-      // has to survive this call, not get wiped out by it. Visibility is a
-      // class (not the `hidden` attribute) so the max-height/opacity
-      // transition in CSS can actually animate in/out instead of an
-      // instant show/hide.
+      // Text goes into its own child span, not the banner's textContent
+      // directly - the action buttons are sibling elements that have to
+      // survive this call, not get wiped out by it. Visibility is a class
+      // (not the `hidden` attribute) so the max-height/opacity transition in
+      // CSS can actually animate in/out instead of an instant show/hide.
       errorBannerTextEl.textContent = text;
       errorBannerEl.classList.add("visible");
     }
@@ -365,17 +503,63 @@
 
     errorBannerCloseBtn.addEventListener("click", clearError);
 
-    // Swaps which controls are visible for the current connection state,
-    // instead of a full page reload to "reconnect" - disconnecting just
-    // brings back the original Connect button, ready to click again.
-    function setConnectedUI(connected) {
-      connectBtn.hidden = connected;
-      muteBtn.hidden = !connected;
-      disconnectBtn.hidden = !connected;
-      connectBtn.disabled = false;
-      if (!connected) {
+    // Raw SDK/DOMException strings ("NotAllowedError", "Permission denied",
+    // a bare fetch failure) are meaningless to the person using this and
+    // used to be printed straight into the UI - one of them even told the
+    // user to open the browser console. Everything user-visible now goes
+    // through these two mappers; the original object still goes to
+    // console.error for whoever is actually debugging.
+    function deviceErrorName(data) {
+      // The DeviceError payload shape isn't documented, so check the places
+      // a DOMException name plausibly lands before falling back to sniffing
+      // the message text.
+      const raw = data?.error ?? data;
+      const name = raw?.name ?? raw?.error?.name ?? "";
+      if (name) return name;
+      const msg = String(raw?.message ?? data?.message ?? "").toLowerCase();
+      if (msg.includes("denied") || msg.includes("not allowed") || msg.includes("permission")) {
+        return "NotAllowedError";
+      }
+      if (msg.includes("not found") || msg.includes("no device")) return "NotFoundError";
+      return "";
+    }
+
+    function friendlyMicError(data) {
+      switch (deviceErrorName(data)) {
+        case "NotAllowedError":
+        case "SecurityError":
+          return "ysf.ai needs your microphone to hear you. Allow microphone access in your browser, then try again.";
+        case "NotFoundError":
+        case "OverconstrainedError":
+          return "No microphone found. Connect one and try again.";
+        case "NotReadableError":
+        case "AbortError":
+          return "Your microphone is in use by another app. Close it and try again.";
+        default:
+          return "We couldn't use your microphone. Check your browser's microphone permissions and try again.";
+      }
+    }
+
+    // UI phases, in the user's terms rather than the transport's:
+    //   welcome    - first run, nothing started yet
+    //   connecting - start pressed, session coming up
+    //   live       - session running, mic hot
+    //   ended      - session over (by the user or by a drop); transcript kept
+    function setPhase(phase) {
+      welcomeEl.hidden = phase !== "welcome";
+      messagesEl.hidden = phase === "welcome";
+      controlsEl.hidden = phase === "welcome";
+      statusWrapEl.hidden = phase === "welcome";
+
+      const live = phase === "live" || phase === "connecting";
+      muteBtn.hidden = !live;
+      endBtn.hidden = !live;
+      restartBtn.hidden = phase !== "ended";
+      startBtn.disabled = phase === "connecting";
+
+      if (phase !== "live") {
         micEnabled = true;
-        muteBtn.textContent = "Mute mic";
+        muteBtn.textContent = "Mute";
         muteBtn.classList.remove("muted");
       }
     }
@@ -396,9 +580,11 @@
     function addMessage(role, text) {
       const wrapper = document.createElement("div");
       wrapper.className = `msg ${role}`;
+      // Visually hidden, not removed: the design distinguishes speakers by
+      // alignment and fill, neither of which a screen reader can perceive.
       const label = document.createElement("span");
-      label.className = "label";
-      label.textContent = role === "you" ? "You" : "Bot";
+      label.className = "sr-only";
+      label.textContent = role === "you" ? "You said: " : "ysf.ai said: ";
       const body = document.createElement("span");
       body.textContent = text;
       wrapper.appendChild(label);
@@ -412,8 +598,8 @@
       const wrapper = document.createElement("div");
       wrapper.className = "msg bot";
       const label = document.createElement("span");
-      label.className = "label";
-      label.textContent = "Bot";
+      label.className = "sr-only";
+      label.textContent = "ysf.ai said: ";
       const indicator = document.createElement("span");
       indicator.className = "thinking-indicator";
       indicator.innerHTML = '<span class="orb"></span>Thinking<span class="dots"><span>.</span><span>.</span><span>.</span></span>';
@@ -456,34 +642,38 @@
       // either before or after Connected (they're on independent tracks:
       // RTC signaling vs. device permission), so clearing on Connected
       // could immediately hide a real, still-relevant device error. Errors
-      // are only cleared on a fresh connect *attempt* (see connectBtn's
-      // click handler) - the one point where "start over" is unambiguous.
-      setStatus("Connected - waiting for bot...", "connecting");
-      setConnectedUI(true);
+      // are only cleared on a fresh start attempt (see startSession) - the
+      // one point where "start over" is unambiguous.
+      setStatus("Getting ready…", "busy");
     });
     client.on(RTVIEvent.Disconnected, () => {
-      setStatus("Disconnected", "disconnected");
-      setConnectedUI(false);
+      setStatus("Ended", "");
+      setPhase("ended");
       currentBotBubble = null;
       currentThinkingIndicator = null;
+      // A drop the user didn't ask for needs explaining; one they triggered
+      // with the End button does not.
+      if (!endedByUser) {
+        showError("The conversation ended unexpectedly. You can start again.");
+      }
+      endedByUser = false;
     });
-    client.on(RTVIEvent.BotReady, () => setStatus("Ready - say something!", "ready"));
+    client.on(RTVIEvent.BotReady, () => {
+      setPhase("live");
+      setStatus("Listening", "live");
+    });
 
-    // Previously only console.error'd, so a mid-session failure (mic
-    // dropped, transport error, etc.) was invisible to anyone not watching
-    // devtools. Surfaced as a real banner instead - cleared on the next
-    // successful (re)connect.
     client.on(RTVIEvent.Error, (data) => {
       console.error("RTVI error:", data);
-      showError(`Error: ${data?.message ?? "something went wrong - see console"}`);
+      showError("Something went wrong. Please try again.");
     });
     client.on(RTVIEvent.DeviceError, (data) => {
       console.error("Device error:", data);
-      showError(`Microphone error: ${data?.message ?? "could not access the microphone"}`);
+      showError(friendlyMicError(data));
     });
 
-    client.on(RTVIEvent.UserStartedSpeaking, () => setStatus("Listening...", "listening"));
-    client.on(RTVIEvent.UserStoppedSpeaking, () => setStatus("Thinking...", "thinking"));
+    client.on(RTVIEvent.UserStartedSpeaking, () => setStatus("Listening…", "busy"));
+    client.on(RTVIEvent.UserStoppedSpeaking, () => setStatus("Thinking…", "busy"));
 
     client.on(RTVIEvent.UserTranscript, (data) => {
       // "final" distinguishes a settled transcript from an in-progress one -
@@ -518,43 +708,62 @@
     client.on(RTVIEvent.BotLlmStopped, () => {
       currentBotBubble = null;
       currentThinkingIndicator = null;
-      setStatus("Ready - say something!", "ready");
+      setStatus("Listening", "live");
     });
 
-    connectBtn.addEventListener("click", async () => {
-      connectBtn.disabled = true;
+    // Single entry point for every way a session can begin: the first-run
+    // button, "Start again" after one ends, and "Try again" after a failure.
+    async function startSession() {
       clearError();
+      endedByUser = false;
       // #messages was never cleared between sessions - reconnecting after a
       // previous session (especially one that got stuck or errored out)
       // left its whole conversation, including any never-resolved
       // "Thinking..." bubbles, sitting in the DOM. That looked like a
       // phantom repeat of old input rather than what it actually was: a
       // fresh connection starting on top of stale leftover state. Every new
-      // connect attempt now starts from a genuinely blank slate.
+      // start now begins from a genuinely blank slate.
       messagesEl.innerHTML = "";
       currentBotBubble = null;
       currentThinkingIndicator = null;
-      setStatus("Connecting...", "connecting");
+      setPhase("connecting");
+      setStatus("Getting ready…", "busy");
       try {
         await client.connect(); // triggers the mic permission prompt + WebRTC handshake
       } catch (err) {
         console.error("Failed to connect:", err);
-        setStatus("Connection failed", "error");
-        showError(`Failed to connect: ${err?.message ?? err}`);
-        connectBtn.disabled = false;
+        setStatus("Not connected", "error");
+        setPhase("ended");
+        // A failure here is either the mic being refused/absent or the bot
+        // being unreachable. If it named a device problem, say so
+        // specifically; otherwise it's a reachability problem.
+        const named = deviceErrorName(err);
+        showError(
+          named
+            ? friendlyMicError(err)
+            : "Can't reach ysf.ai right now. Check your connection and try again."
+        );
       }
-    });
+    }
+
+    startBtn.addEventListener("click", startSession);
+    restartBtn.addEventListener("click", startSession);
+    errorRetryBtn.addEventListener("click", startSession);
 
     muteBtn.addEventListener("click", () => {
       micEnabled = !micEnabled;
       client.enableMic(micEnabled);
-      muteBtn.textContent = micEnabled ? "Mute mic" : "Unmute mic";
+      muteBtn.textContent = micEnabled ? "Mute" : "Unmute";
       muteBtn.classList.toggle("muted", !micEnabled);
+      setStatus(micEnabled ? "Listening" : "Muted", micEnabled ? "live" : "");
     });
 
-    disconnectBtn.addEventListener("click", () => {
+    endBtn.addEventListener("click", () => {
+      endedByUser = true;
       client.disconnect(); // RTVIEvent.Disconnected above resets the UI
     });
+
+    setPhase("welcome");
   </script>
 </body>
 </html>
