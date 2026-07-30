@@ -43,6 +43,7 @@ from loguru import logger
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import ErrorFrame, Frame, LLMRunFrame, TextFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
@@ -1087,7 +1088,25 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
     context = LLMContext(tools=[honda_price_tool, browse_honda_page_tool, browse_mg_page_tool])
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
-        user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+        # Defaults (confidence=0.7, min_volume=0.6) were firing "user
+        # started speaking" on plain ambient room noise - confirmed live:
+        # 13 false turns in 80s of a real session, each one a different
+        # Whisper hallucination from near-silent audio (not the
+        # prompt-echo bug, which is a separate, already-fixed issue -
+        # these were genuinely different phrases every time). Raised to
+        # require louder, more confident audio before committing to a
+        # turn. start_secs deliberately left at its default (0.2) -
+        # raising it to 0.3 was tried and reverted: it measurably delayed
+        # recognizing short, real interruptions ("Wait, stop, never
+        # mind.") past interrupted_context_test's 4s window. confidence/
+        # min_volume filter WHETHER something counts as speech; start_secs
+        # controls how fast a real interruption gets caught - only the
+        # former needed tightening here.
+        user_params=LLMUserAggregatorParams(
+            vad_analyzer=SileroVADAnalyzer(
+                params=VADParams(confidence=0.85, min_volume=0.7)
+            )
+        ),
         # Bulletproofing: a long-running conversation would otherwise grow
         # LLMContext unboundedly - every future turn resends the entire
         # history, so cost/latency creep up forever and eventually risk
