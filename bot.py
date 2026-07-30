@@ -210,7 +210,7 @@ SYSTEM_INSTRUCTION = (
     "question instead."
 )
 
-GREETING_MESSAGE = "Hi! How can I help you today?"
+GREETING_MESSAGE = "Hi, I'm ysf.ai. Ask me anything - I can also look things up live when it helps."
 FALLBACK_ERROR_MESSAGE = "Sorry, I hit a glitch there. Could you say that again?"
 FALLBACK_COOLDOWN_SECS = 5.0
 
