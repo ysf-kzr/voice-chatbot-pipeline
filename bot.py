@@ -229,6 +229,11 @@ LLM_MODEL_FALLBACK_CHAIN = [
     "llama-3.1-8b-instant",
 ]
 
+GROQ_API_CHAIN = [
+    os.environ["GROQ_API_KEY"],
+    os.environ.get("GROQ_API_KEY_2")
+]
+
 
 def is_rate_limit_error(error_text: str) -> bool:
     """Fallback heuristic rate-limit detector: substring match on the
@@ -1217,6 +1222,7 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
     # forever.
     tool_call_retry_used = False
     current_model_index = 0
+    current_key_index = 0
     # Once a rate limit forces a move off the primary model, nothing was
     # previously moving things back - a fallback model, once switched to,
     # stayed in use for the rest of the process's life even long after
@@ -1231,7 +1237,7 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         nonlocal model_fallback_reset_task
 
         async def _reset_after_delay():
-            nonlocal current_model_index
+            nonlocal current_model_index, current_key_index
             await asyncio.sleep(MODEL_FALLBACK_RESET_SECS)
             primary_model = LLM_MODEL_FALLBACK_CHAIN[0]
             logger.warning(
@@ -1239,6 +1245,7 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
                 f"{MODEL_FALLBACK_RESET_SECS:.0f}s on a fallback model."
             )
             current_model_index = 0
+            current_key_index = 0
             llm._settings.model = primary_model
 
         # A second rate limit before the previous timer fires should push
@@ -1257,7 +1264,7 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
 
     @worker.event_handler("on_pipeline_error")
     async def on_pipeline_error(worker, frame: ErrorFrame):
-        nonlocal consecutive_fallback_failures, circuit_open_until, current_model_index, tool_call_retry_used
+        nonlocal consecutive_fallback_failures, circuit_open_until, current_model_index, tool_call_retry_used, current_key_index
         logger.error(f"Pipeline error from {frame.processor}: {frame.error}")
         if frame.fatal:
             return
@@ -1299,6 +1306,23 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
                 f"model to {next_model!r} for subsequent turns."
             )
             _schedule_model_fallback_reset()
+        elif error_frame_is_rate_limit(frame) and current_key_index + 1 < len(GROQ_API_CHAIN):
+            current_key_index += 1
+            current_model_index = 0
+            llm._settings.model = LLM_MODEL_FALLBACK_CHAIN[current_model_index]
+            # create_client() defaults base_url to None if not passed -
+            # that would point the rebuilt client at OpenAI's real API
+            # instead of Groq's, since AsyncOpenAI's own default is used
+            # otherwise. Must match the base_url the original
+            # GroqLLMService construction used.
+            llm._client = llm.create_client(
+                api_key=GROQ_API_CHAIN[current_key_index],
+                base_url="https://api.groq.com/openai/v1",
+            )
+            logger.error(
+                f"Rate limit hit on every model for the current API key - "
+                f"switching to backup key #{current_key_index + 1}."
+            )
 
         # A failure in pipecat's own background context-summarization pass
         # has nothing to do with the user's actual, current turn - showing
