@@ -70,6 +70,8 @@ from pipecat.services.llm_service import FunctionCallParams
 from pipecat.services.whisper.base_stt import Transcription
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
+from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.workers.runner import WorkerRunner
 
 # Not override=True: a real env var the user already set (e.g. `export
@@ -1000,17 +1002,190 @@ def _looks_like_known_hallucination(text: str) -> bool:
     return any(phrase in words_only for phrase in _HALLUCINATION_PHRASES)
 
 
+# _ROMAN_URDU_STT_PROMPT's prompt-conditioning trick is a heuristic, not a
+# documented API guarantee (see its own comment) - Whisper can still fall
+# back to Nastaliq (Perso-Arabic script) for the "ur" call despite it,
+# especially on utterances where the prompt bias has less to compete
+# against. Previously nothing actually caught this - the old repr()-based
+# debug log comment only helped a human *notice* it in logs after the
+# fact, it didn't stop the native-script text from reaching the LLM (and
+# the user, since this variant's replies are shown as text) as if that
+# were the intended output. Detected here by Unicode range and handed to
+# _transliterate_nastaliq_to_roman below (called from _transcribe) rather
+# than discarded - falling back to the concurrent "en" candidate instead
+# would silently swap real Urdu content for Whisper's separate (and
+# likely wrong) English-forced guess at the same audio, losing what was
+# actually said rather than just its script. This detector is also kept
+# as a backstop inside _reject_transcript_reason below, for whatever the
+# transliteration table doesn't cover (e.g. Arabic diacritics) - covers
+# every Unicode block Urdu's Nastaliq characters actually come from, not
+# just the base Arabic block - Urdu-specific letters and presentation
+# forms live outside it. Built from explicit hex codepoints via chr(), not typed
+# Unicode characters or \uXXXX string escapes - both are opaque in a diff
+# and \uXXXX escapes specifically are prone to silently losing an escaping
+# level when passed through several layers of shell/tool quoting. Named
+# integer ranges are unambiguous and the actual regex is reconstructed the
+# same way every time this module is imported.
+_ARABIC_SCRIPT_RANGES = [
+    (0x0600, 0x06FF),  # Arabic
+    (0x0750, 0x077F),  # Arabic Supplement (extra Nastaliq letters)
+    (0x08A0, 0x08FF),  # Arabic Extended-A
+    (0xFB50, 0xFDFF),  # Arabic Presentation Forms-A
+    (0xFE70, 0xFEFF),  # Arabic Presentation Forms-B
+]
+_ARABIC_SCRIPT_PATTERN = re.compile(
+    "[" + "".join(f"{chr(lo)}-{chr(hi)}" for lo, hi in _ARABIC_SCRIPT_RANGES) + "]"
+)
+
+
+def _contains_arabic_script(text: str) -> bool:
+    """True if `text` contains any Perso-Arabic (Nastaliq) script
+    character - see _ARABIC_SCRIPT_PATTERN above for why this means the
+    Roman-script prompt bias failed to hold for this utterance.
+    """
+    return bool(_ARABIC_SCRIPT_PATTERN.search(text))
+
+
+# Rule-based Nastaliq -> Roman Urdu transliteration, used when the
+# _ROMAN_URDU_STT_PROMPT bias fails to hold and Whisper returns native
+# Perso-Arabic script anyway (see _contains_arabic_script above). A
+# character/digraph lookup table, not a full linguistic transliterator -
+# Urdu's short vowels (zabar/zer/pesh) are normally OMITTED from written
+# Nastaliq text entirely (exactly like consonant-only Arabic script), so
+# no letter-mapping scheme can recover a sound that was never written
+# down in the first place. This produces the same kind of consonant-heavy
+# approximation a native reader mentally fills in when reading Nastaliq
+# aloud, not a phonetically complete transcription - good enough to make
+# the text READABLE in Roman script to someone who can't read Nastaliq,
+# not a claim of transliteration accuracy. An LLM call could do
+# noticeably better here, but that costs a real API round-trip on every
+# occurrence; this stays a pure, local, zero-latency lookup instead.
+#
+# Two-character entries are aspirated digraphs: a consonant followed by
+# do-chashmi he (ھ) renders as that consonant + "h" (e.g. بھ -> "bh",
+# کھ -> "kh") - ھ's Roman rendering depends entirely on the letter before
+# it, so these must be matched as a pair, checked BEFORE the single-
+# character map falls back to treating ھ (or the preceding letter) alone.
+_URDU_DIGRAPH_MAP = {
+    "بھ": "bh", "پھ": "ph", "تھ": "th", "ٹھ": "th", "جھ": "jh",
+    "چھ": "chh", "دھ": "dh", "ڈھ": "dh", "رھ": "rh", "ڑھ": "rh",
+    "کھ": "kh", "گھ": "gh", "لھ": "lh", "مھ": "mh", "نھ": "nh",
+    "لا": "la",  # lam-alif ligature
+}
+
+# Single-character map. Several Urdu letters legitimately collapse onto
+# the same Roman letter (ث/س/ص all -> "s", ذ/ز/ض/ظ all -> "z", ت/ط both
+# -> "t", ح/ہ both -> "h") - this is a real property of Urdu orthography
+# (multiple historical-Arabic spellings for sounds Urdu no longer
+# distinguishes), not a mapping bug. ع and ء (ayin/hamza, both glottal
+# stops with no direct Roman letter) render as an apostrophe, the
+# standard informal-Roman-Urdu convention, not silently dropped - losing
+# the character entirely would fuse two syllables together unmarked.
+# Combining-mark diacritics (harakat) only appear at all in fully-
+# vocalized text (dictionaries, children's books, disambiguation) - casual
+# spoken-Urdu transcription essentially never produces them, but when they
+# ARE present they carry real, recoverable vowel information (unlike a
+# short vowel with no diacritic at all, which genuinely isn't written down
+# anywhere - see this table's own module comment). fatha/kasra/damma and
+# their tanwin (nunation) variants map to the vowel sound they actually
+# represent rather than being dropped; sukun correctly maps to "" since it
+# explicitly marks the ABSENCE of a vowel, not a vowel that got lost.
+# Shadda (gemination - doubles the preceding consonant) isn't a simple
+# 1:1 character substitution and is handled specially in
+# _transliterate_nastaliq_to_roman below, not in this table.
+_URDU_CHAR_MAP = {
+    "ا": "a", "آ": "aa", "ب": "b", "پ": "p", "ت": "t", "ٹ": "t",
+    "ث": "s", "ج": "j", "چ": "ch", "ح": "h", "خ": "kh", "د": "d",
+    "ڈ": "d", "ذ": "z", "ر": "r", "ڑ": "r", "ز": "z", "ژ": "zh",
+    "س": "s", "ش": "sh", "ص": "s", "ض": "z", "ط": "t", "ظ": "z",
+    "ع": "'", "غ": "gh", "ف": "f", "ق": "q", "ک": "k", "گ": "g",
+    "ل": "l", "م": "m", "ن": "n", "ں": "n", "و": "o", "ہ": "h",
+    "ھ": "h", "ء": "'", "ی": "i", "ے": "e",
+    "۰": "0", "۱": "1", "۲": "2", "۳": "3", "۴": "4",
+    "۵": "5", "۶": "6", "۷": "7", "۸": "8", "۹": "9",
+    "،": ",", "؟": "?", "۔": ".",
+    "َ": "a", "ِ": "i", "ُ": "u",  # fatha, kasra, damma - short a/i/u
+    "ً": "an", "ٍ": "in", "ٌ": "un",  # tanwin (nunation) variants
+    "ْ": "",  # sukun - explicitly no vowel, not a dropped one
+}
+
+# Shadda (ّ, U+0651) doubles whatever consonant precedes it - "کّ" is "kk",
+# not "k" + some standalone shadda sound. Needs the character already
+# appended to `result` to duplicate, so it can't live in a flat character
+# map the way the other diacritics above do.
+_SHADDA = "ّ"
+
+
+def _maybe_transliterate(text: str, lang: str) -> str:
+    """Transliterates `text` if it's still in Nastaliq script, otherwise
+    returns it unchanged. Applied to BOTH the winning and (if it's ever
+    used as a fallback) losing STT candidate in _transcribe - a Nastaliq
+    "ur" candidate can end up on either side of that fallback depending on
+    why the other candidate got rejected, and both deserve the same
+    chance at recovering real content instead of being discarded.
+    """
+    if not _contains_arabic_script(text):
+        return text
+    transliterated = _transliterate_nastaliq_to_roman(text)
+    logger.debug(
+        f"STT bilingual: {lang} candidate was Nastaliq script - "
+        f"transliterated {text!r} -> {transliterated!r}"
+    )
+    return transliterated
+
+
+def _transliterate_nastaliq_to_roman(text: str) -> str:
+    """Best-effort Nastaliq -> Roman Urdu transliteration via the digraph/
+    character maps above. Greedy longest-match: tries a 2-character
+    digraph first, then shadda (doubles whatever was just appended - see
+    _SHADDA above), then falls back to the single-character map, and
+    leaves anything none of those cover untouched (spaces, Latin
+    characters already in the string, punctuation, or an Arabic-script
+    character outside standard Urdu usage) rather than dropping it - an
+    unmapped character surviving into the output is what lets
+    _contains_arabic_script's backstop in _reject_transcript_reason catch
+    a transliteration this table couldn't fully clean up.
+    """
+    result = []
+    i = 0
+    while i < len(text):
+        two = text[i : i + 2]
+        if two in _URDU_DIGRAPH_MAP:
+            result.append(_URDU_DIGRAPH_MAP[two])
+            i += 2
+            continue
+        ch = text[i]
+        if ch == _SHADDA:
+            if result:
+                result.append(result[-1])
+            i += 1
+            continue
+        result.append(_URDU_CHAR_MAP.get(ch, ch))
+        i += 1
+    return "".join(result)
+
+
 def _reject_transcript_reason(text: str, confidence: float) -> str | None:
     """Why a transcript candidate should be rejected, or None if it's good
     enough to use as-is. Empty text is never "rejected" here - there's
     nothing to reject, it just means no speech was heard, which is the
     pipeline's existing behavior for silence.
+
+    By the time this runs, _transcribe has already tried transliterating
+    any Nastaliq text back to Roman script (see
+    _transliterate_nastaliq_to_roman above) - the _contains_arabic_script
+    check here is a backstop for whatever that table didn't cover (e.g.
+    an Arabic diacritic outside the harakat range, or a character the
+    table genuinely has no mapping for), not the primary handling for the
+    common case anymore.
     """
     stripped = text.strip()
     if not stripped:
         return None
     if confidence < _MIN_ACCEPTABLE_CONFIDENCE:
         return f"confidence {confidence:.3f} below floor {_MIN_ACCEPTABLE_CONFIDENCE}"
+    if _contains_arabic_script(stripped):
+        return "still contains Nastaliq/Perso-Arabic script after transliteration"
     if _is_prompt_echo(stripped):
         return "echoed the Roman-Urdu prompt-bias text verbatim"
     if _looks_like_known_hallucination(stripped):
@@ -1096,12 +1271,18 @@ class BilingualGroqSTTService(GroqSTTService):
     margins as small as 0.002, and Whisper's own hallucinations on
     short/quiet clips score competitively with real speech regardless of
     language. `_reject_transcript_reason` below screens the winner for a
-    confidence floor, a verbatim prompt-bias echo, and known stock
-    hallucination phrases; if the winner is rejected, the OTHER candidate
-    is tried before giving up - the original version blanked the winner's
-    text unconditionally, which threw away a good English transcript
-    whenever "ur" happened to win the raw comparison and then get
-    rejected as an echo.
+    confidence floor, Nastaliq script the prompt bias failed to prevent
+    (see `_contains_arabic_script`), a verbatim prompt-bias echo, and
+    known stock hallucination phrases; if the winner is rejected, the
+    OTHER candidate is tried before giving up - the original version
+    blanked the winner's text unconditionally, which threw away a good
+    English transcript whenever "ur" happened to win the raw comparison
+    and then get rejected as an echo. Nastaliq script specifically isn't
+    just rejected, though - `_maybe_transliterate` converts it to Roman
+    script first (see its own comment), since falling back to the "en"
+    candidate for a genuinely Urdu utterance would silently swap the real
+    content for Whisper's separate, likely-wrong English-forced guess at
+    the same audio, not just fail to fix its script.
 
     NOTE: The LLM is instructed (system prompt) to always reply in English
     regardless of input language. This was originally required because the
@@ -1153,10 +1334,20 @@ class BilingualGroqSTTService(GroqSTTService):
         winner, conf = candidates[winner_lang]
         loser, loser_conf = candidates[loser_lang]
 
+        # The Roman-script prompt bias (see _ROMAN_URDU_STT_PROMPT) failed
+        # to hold for this utterance - transliterate rather than discard.
+        # Falling straight to _reject_transcript_reason below (which would
+        # reject on native script and fall back to the "en" candidate)
+        # would silently swap real Urdu content for Whisper's separate
+        # (and likely wrong) English-forced guess at the same audio -
+        # losing what was actually said, not just changing its script.
+        winner.text = _maybe_transliterate(winner.text, winner_lang)
+
         # See _reject_transcript_reason above: catches a confidence floor
-        # miss, a verbatim prompt-bias echo, or a known Whisper stock
-        # hallucination phrase, before any of them ever reach the LLM as if
-        # the user actually said it.
+        # miss, a verbatim prompt-bias echo, a known Whisper stock
+        # hallucination phrase, or Nastaliq script the transliteration
+        # above couldn't fully clean up, before any of them ever reach the
+        # LLM as if the user actually said it.
         reject_reason = _reject_transcript_reason(winner.text, conf)
         if reject_reason:
             logger.debug(
@@ -1164,7 +1355,12 @@ class BilingualGroqSTTService(GroqSTTService):
                 f"({reject_reason}): {winner.text!r}"
             )
             # The winner being bad doesn't mean the loser was too - try it
-            # before giving up on the turn entirely.
+            # before giving up on the turn entirely. Same transliteration
+            # pass as the winner got above: the loser can just as easily
+            # be a Nastaliq "ur" candidate, e.g. when "en" won the pick
+            # but then got rejected for an unrelated reason (a
+            # hallucination phrase, low confidence).
+            loser.text = _maybe_transliterate(loser.text, loser_lang)
             fallback_reject_reason = _reject_transcript_reason(loser.text, loser_conf)
             if not fallback_reject_reason:
                 logger.debug(
@@ -1397,7 +1593,7 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         # 300-800ms, so any of them was ending the turn early. Raised to
         # 0.8 - still leaves timeout = max(0, GROQ_TTFS_P99 - stop_secs)
         # = 1.54 - 0.8 = 0.74s positive, so this doesn't collapse
-        # TurnAnalyzerUserTurnStopStrategy's STT wait timeout to 0
+        # SpeechTimeoutUserTurnStopStrategy's STT wait timeout to 0
         # (pipecat warns exactly about that case). Logs one harmless
         # "VAD stop_secs differs from the recommended default" startup
         # warning as a result - expected, not a fault.
@@ -1408,10 +1604,43 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         # mind.") past interrupted_context_test's 4s window. Barge-in
         # latency is driven by start_secs, not stop_secs, so raising
         # stop_secs above doesn't reopen that regression.
+        #
+        # user_turn_strategies is set explicitly for the same reason the
+        # VAD params above are: leaving it unset silently pulls in
+        # pipecat's own default stop strategy - TurnAnalyzerUserTurnStopStrategy
+        # wrapping LocalSmartTurnAnalyzerV3, a local ONNX model that
+        # predicts end-of-turn from the acoustic/prosodic content of the
+        # audio, not just silence duration. That default was running the
+        # entire time before this comment existed, completely undocumented -
+        # confirmed live: it measures at ~209ms of real inference latency
+        # per turn (loaded and timed directly:
+        # LocalSmartTurnAnalyzerV3().analyze_end_of_turn() on a 2s clip).
+        # It's also a second, independent way a turn can end early: it
+        # runs its own judgment on whatever audio VAD hands it, and can
+        # decide a mid-sentence pause "sounds finished" regardless of how
+        # generously stop_secs above is tuned - a second, harder-to-see
+        # contributor to the same fragmentation bug that motivated raising
+        # stop_secs in the first place. Replaced here with
+        # SpeechTimeoutUserTurnStopStrategy - a plain, already-understood
+        # timer with no acoustic judgment call and no per-turn inference
+        # cost, matching how this whole VAD tuning pass already reasons
+        # about pause length directly rather than relying on a model to
+        # guess. user_speech_timeout is deliberately small (0.2, not
+        # pipecat's own 0.6 default): this strategy's timer starts only
+        # AFTER stop_secs has already elapsed (see
+        # SpeechTimeoutUserTurnStopStrategy's own docstring - VAD-stop,
+        # then this timer, sequentially) - stacking pipecat's default 0.6s
+        # on top of the already-generous 0.8s stop_secs above would double
+        # count the same "give them a chance to continue" cushion and push
+        # total turn-end latency to ~1.4s. 0.2s here is just a final
+        # safety margin, not a second full pause-tolerance window.
         user_params=LLMUserAggregatorParams(
             vad_analyzer=SileroVADAnalyzer(
                 params=VADParams(confidence=0.75, min_volume=0.6, stop_secs=0.8)
-            )
+            ),
+            user_turn_strategies=UserTurnStrategies(
+                stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.2)]
+            ),
         ),
         # Bulletproofing: a long-running conversation would otherwise grow
         # LLMContext unboundedly - every future turn resends the entire

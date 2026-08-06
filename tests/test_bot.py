@@ -269,6 +269,105 @@ class TestRejectTranscriptReason:
         assert reason is not None
         assert "hallucination" in reason
 
+    def test_accepts_clean_transliterated_roman_text(self):
+        # What _transcribe actually passes in here after transliteration -
+        # by the time this runs, real Nastaliq text has already been
+        # converted, so this should just be a normal accepted transcript.
+        assert bot._reject_transcript_reason("mjhe iski qimt malom krni hai", -0.1) is None
+
+
+class TestContainsArabicScript:
+    def test_detects_nastaliq_text(self):
+        assert bot._contains_arabic_script("مجھے اس کی قیمت معلوم کرنی ہے") is True
+
+    def test_does_not_flag_roman_urdu(self):
+        assert bot._contains_arabic_script("Mujhe iski qeemat maloom karni hai") is False
+
+    def test_does_not_flag_plain_english(self):
+        assert bot._contains_arabic_script("What is the price of the Civic?") is False
+
+    def test_does_not_flag_empty_string(self):
+        assert bot._contains_arabic_script("") is False
+
+    def test_detects_a_single_stray_nastaliq_character_in_otherwise_roman_text(self):
+        # Confirms the check isn't an all-or-nothing script classifier -
+        # one leftover native character (e.g. from an incomplete
+        # transliteration) is enough to flag.
+        assert bot._contains_arabic_script("Mujhe ے chahiye") is True
+
+
+class TestTransliterateNastaliqToRoman:
+    def test_transliterates_a_real_urdu_sentence_to_readable_roman_script(self):
+        result = bot._transliterate_nastaliq_to_roman("مجھے اس کی قیمت معلوم کرنی ہے")
+        # Not asserting exact output (short vowels are lost by design, see
+        # the function's docstring) - asserting the output is now plain
+        # ASCII/Latin, i.e. actually in Roman script.
+        assert result.isascii()
+        assert not bot._contains_arabic_script(result)
+        assert len(result) > 0
+
+    def test_aspirated_digraph_depends_on_the_preceding_consonant(self):
+        # بھ (be + do-chashmi he) -> "bh", not "b" + "h" separately handled
+        # wrong, and not confused with, say, کھ -> "kh".
+        assert bot._transliterate_nastaliq_to_roman("بھ") == "bh"
+        assert bot._transliterate_nastaliq_to_roman("کھ") == "kh"
+        assert bot._transliterate_nastaliq_to_roman("تھ") == "th"
+
+    def test_leaves_latin_text_and_spaces_untouched(self):
+        assert bot._transliterate_nastaliq_to_roman("hello world 123") == "hello world 123"
+
+    def test_leaves_an_unmapped_character_as_is_rather_than_dropping_it(self):
+        # Anything the table has no entry for survives unchanged (not
+        # deleted) - this is what lets _contains_arabic_script's backstop
+        # in _reject_transcript_reason still catch a transliteration this
+        # table couldn't fully clean up, instead of silently losing
+        # content and looking like it succeeded.
+        assert "€" in bot._transliterate_nastaliq_to_roman("€100")
+
+    def test_diacritics_on_a_consonant_produce_the_vowel_they_represent(self):
+        # When present (fully-vocalized text only - rare in practice),
+        # fatha/kasra/damma carry real, recoverable vowel information and
+        # should become that vowel, not be discarded. ک = "k".
+        assert bot._transliterate_nastaliq_to_roman("کَ") == "ka"
+        assert bot._transliterate_nastaliq_to_roman("کِ") == "ki"
+        assert bot._transliterate_nastaliq_to_roman("کُ") == "ku"
+
+    def test_sukun_marks_absence_of_vowel_not_a_dropped_one(self):
+        # سْ = seen + sukun ("no vowel here") - correctly empty, but for a
+        # different reason than "this diacritic has no mapping": sukun
+        # explicitly says there ISN'T a vowel, so "" is the right answer,
+        # not a gap.
+        assert bot._transliterate_nastaliq_to_roman("سْ") == "s"
+
+    def test_shadda_doubles_the_preceding_consonant(self):
+        # کّ = kaf + shadda (gemination mark) -> "kk", not "k" alone and
+        # not a standalone shadda sound - shadda has no independent Roman
+        # letter, it modifies what came before it.
+        assert bot._transliterate_nastaliq_to_roman("کّ") == "kk"
+
+    def test_tanwin_variants_add_the_n_ending_they_represent(self):
+        assert bot._transliterate_nastaliq_to_roman("کً") == "kan"
+        assert bot._transliterate_nastaliq_to_roman("کٍ") == "kin"
+        assert bot._transliterate_nastaliq_to_roman("کٌ") == "kun"
+
+    def test_no_arabic_script_survives_a_fully_vocalized_word(self):
+        result = bot._transliterate_nastaliq_to_roman("کَتّاب")
+        assert not bot._contains_arabic_script(result)
+
+
+class TestMaybeTransliterate:
+    def test_transliterates_nastaliq_text(self):
+        result = bot._maybe_transliterate("مجھے", "ur")
+        assert result.isascii()
+
+    def test_leaves_roman_text_unchanged(self):
+        text = "Mujhe iski qeemat maloom karni hai"
+        assert bot._maybe_transliterate(text, "ur") == text
+
+    def test_leaves_english_text_unchanged(self):
+        text = "What is the price of the Civic?"
+        assert bot._maybe_transliterate(text, "en") == text
+
 
 class TestBrowseToolSchemas:
     """Regression guard: the browse tools' `topic` argument must stay FREE
