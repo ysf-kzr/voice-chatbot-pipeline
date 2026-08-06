@@ -29,10 +29,12 @@ Requires GROQ_API_KEY in a .env file.
 """
 
 import asyncio
+import io
 import os
 import re
 import sys
 import time
+import wave
 
 import openai
 import pyaudio
@@ -44,7 +46,7 @@ from loguru import logger
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import ErrorFrame, Frame, LLMRunFrame, TextFrame
+from pipecat.frames.frames import ErrorFrame, Frame, LLMRunFrame, LLMSummarizeContextFrame, TextFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -53,7 +55,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
-from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.processors.frameworks.rtvi.models import (
     BotLLMStartedMessage,
     BotLLMStoppedMessage,
@@ -230,10 +232,19 @@ LLM_MODEL_FALLBACK_CHAIN = [
     "llama-3.1-8b-instant",
 ]
 
-GROQ_API_CHAIN = [
-    os.environ["GROQ_API_KEY"],
-    os.environ.get("GROQ_API_KEY_2")
-]
+# Only real keys - GROQ_API_KEY_2 is optional (a second key for extending
+# daily quota once every model has rate-limited on the first). Bug fixed
+# here: `os.environ.get("GROQ_API_KEY_2")` used to be appended
+# unconditionally, so this list always had length 2 even when nobody set
+# a second key - which meant on_pipeline_error's key-fallback branch
+# (`current_key_index + 1 < len(GROQ_API_CHAIN)`) was always reachable and
+# rebuilt the Groq client with `api_key=None`. That raises inside the
+# error handler itself, before the user-facing apology message ever gets
+# sent, and left current_model_index reset to 0 (the model that had just
+# rate-limited). Filtering out unset keys means len(GROQ_API_CHAIN) is 1
+# for everyone who hasn't set GROQ_API_KEY_2, and that branch is correctly
+# unreachable - see README's setup section for how to add a second key.
+GROQ_API_CHAIN = [key for key in (os.environ["GROQ_API_KEY"], os.environ.get("GROQ_API_KEY_2")) if key]
 
 
 def is_rate_limit_error(error_text: str) -> bool:
@@ -260,25 +271,44 @@ def error_frame_is_rate_limit(frame: ErrorFrame) -> bool:
     """Real, typed rate-limit check - prefers this over string matching.
 
     Groq's client is OpenAI-compatible, so GroqLLMService raises
-    openai.RateLimitError under the hood - a class with a reliable
-    class-level `status_code = 429` (see the installed openai package's
-    _exceptions.py), a genuine signal rather than a guess based on what the
-    error message happens to say. Both the normal chat-completion path and
-    the background context-summarization path (pipecat's
-    services/openai/base_llm.py and services/llm_service.py) call
-    push_error(..., exception=e), so frame.exception is populated in both
-    cases this pipeline actually hits.
+    openai.RateLimitError under the hood for a plain HTTP 429 - a class
+    with a reliable class-level `status_code = 429` (see the installed
+    openai package's _exceptions.py), a genuine signal rather than a guess
+    based on what the error message happens to say. Both the normal
+    chat-completion path and the background context-summarization path
+    (pipecat's services/openai/base_llm.py and services/llm_service.py)
+    call push_error(..., exception=e), so frame.exception is populated in
+    both cases this pipeline actually hits.
+
+    Groq doesn't always use HTTP 429 for a rate-limit-family failure,
+    though - confirmed live: "this single request's token count already
+    exceeds the model's entire per-minute budget" (as opposed to "you've
+    used up your quota, wait a bit") comes back as HTTP 413, not 429.
+    openai-python's status->exception mapping only names 429 as
+    RateLimitError (see the installed package's _client.py
+    _make_status_error) - every other 4xx/5xx, 413 included, falls into
+    the generic APIStatusError bucket, which the check above alone would
+    wrongly trust as "definitely not a rate limit" and skip model/key
+    fallback entirely for exactly the failure mode that fallback exists
+    for. Every openai.APIError (RateLimitError's own base class) parses
+    Groq's JSON body into a `.code` attribute regardless of which HTTP
+    status Groq attached - confirmed live this is "rate_limit_exceeded" on
+    the 413 case too - so checking that catches it without having to
+    special-case every status code Groq might use for this family of
+    error.
 
     Falls back to the text heuristic (is_rate_limit_error) only when
     frame.exception is None - some other pipecat-internal path might push
     an ErrorFrame without one. If exception IS present but isn't a
-    RateLimitError, that's authoritative and trusted over the text
-    heuristic, not just an additional vote - a non-rate-limit exception
-    whose str() happens to contain "429" shouldn't be miscounted just
-    because the text check alone would have said yes.
+    RateLimitError and doesn't carry this code, that's authoritative and
+    trusted over the text heuristic, not just an additional vote - a
+    non-rate-limit exception whose str() happens to contain "429" shouldn't
+    be miscounted just because the text check alone would have said yes.
     """
     if isinstance(frame.exception, openai.RateLimitError):
         return True
+    if isinstance(frame.exception, openai.APIError):
+        return frame.exception.code == "rate_limit_exceeded"
     if frame.exception is not None:
         return False
     return is_rate_limit_error(str(frame.error).lower())
@@ -556,6 +586,17 @@ def _fetch_and_extract_page_sync(base_url: str, slug: str) -> str:
     return text[:_PAGE_TEXT_MAX_CHARS]
 
 
+# Below this length, the "topic in key" direction of the fuzzy fallback
+# below is unsafe: an empty (or near-empty) topic is a substring of every
+# dict key, so it matched the first entry in iteration order
+# unconditionally. Confirmed live: resolve_topic_slug("", HONDA_PAGE_SLUGS)
+# resolved to "civic-standard" - the tool then reported found=True with
+# real Civic page content for a request that had nothing to do with it, a
+# hallucination the LLM has no way to detect. No real page_slugs key is
+# shorter than this, so nothing legitimate is lost by requiring it.
+_MIN_FUZZY_TOPIC_CHARS = 3
+
+
 def resolve_topic_slug(topic: str, page_slugs: dict[str, str]) -> str | None:
     """Resolves a (lowercased) topic string to a real page slug.
 
@@ -573,6 +614,8 @@ def resolve_topic_slug(topic: str, page_slugs: dict[str, str]) -> str | None:
     slug = page_slugs.get(topic)
     if slug is not None:
         return slug
+    if len(topic.strip()) < _MIN_FUZZY_TOPIC_CHARS:
+        return None
     return next(
         (s for key, s in page_slugs.items() if key in topic or topic in key),
         None,
@@ -801,17 +844,61 @@ browse_mg_page_tool = make_browse_page_tool(
 
 
 def _avg_logprob(result: Transcription) -> float:
-    """Mean segment log-probability, used as a confidence proxy.
+    """Duration-weighted mean segment log-probability, used as a confidence
+    proxy. Whisper doesn't expose a single "confidence" number, but each
+    segment's avg_logprob (closer to 0 = more confident) is the standard
+    stand-in.
 
-    Whisper doesn't expose a single "confidence" number, but each segment's
-    avg_logprob (closer to 0 = more confident) is the standard stand-in.
+    Weighted by each segment's (end - start) duration, not a flat mean - a
+    flat mean lets a single short outlier segment (a brief noise burst
+    scored differently than the surrounding real speech) pull a
+    multi-segment transcript's overall score further than its actual share
+    of the audio warrants; weighting lets the long, dominant segment(s)
+    carry the score instead. This is a general quality improvement to the
+    confidence estimate itself, not what fixes the "ur wins on English
+    audio" bug - that's the margin in _pick_bilingual_result below, since a
+    genuinely more-confident short hallucination still legitimately scores
+    higher than a longer, merely-comparable real transcript even with this
+    weighting. Falls back to a flat mean when segments carry no duration
+    info (e.g. hand-built segments in a test) rather than dividing by zero.
+
     Returns -inf for silent/empty audio (no segments) so it always loses to
     a real transcript when comparing two candidates.
     """
     segments = getattr(result, "segments", None) or []
     if not segments:
         return float("-inf")
+    weighted_sum = 0.0
+    total_duration = 0.0
+    for s in segments:
+        duration = max(getattr(s, "end", 0.0) - getattr(s, "start", 0.0), 0.0)
+        weighted_sum += getattr(s, "avg_logprob", 0.0) * duration
+        total_duration += duration
+    if total_duration > 0:
+        return weighted_sum / total_duration
     return sum(getattr(s, "avg_logprob", 0.0) for s in segments) / len(segments)
+
+
+def _wav_duration_secs(audio: bytes) -> float:
+    """Duration in seconds of a WAV byte string.
+
+    Used as a cheap pre-flight check before spending two concurrent Groq API
+    calls transcribing a clip too short to contain real speech, and to pick
+    the confidence margin in _pick_bilingual_result below. `audio` here is
+    always a WAV file this pipeline just built itself (see
+    SegmentedSTTService._handle_user_stopped_speaking), so a parse failure
+    isn't expected - but reports 0.0 rather than raising if it ever happens,
+    which degrades to "treat as too short to transcribe" instead of crashing
+    STT entirely.
+    """
+    try:
+        with wave.open(io.BytesIO(audio), "rb") as wav_file:
+            frame_rate = wav_file.getframerate()
+            if frame_rate <= 0:
+                return 0.0
+            return wav_file.getnframes() / frame_rate
+    except (wave.Error, EOFError):
+        return 0.0
 
 
 # Whisper's own output script for language="ur" is Perso-Arabic (Nastaliq) -
@@ -848,6 +935,138 @@ _ROMAN_URDU_STT_PROMPT = (
 # confidence score alone.
 _ROMAN_URDU_STT_PROMPT_NORMALIZED = re.sub(r"[.,?!]", "", _ROMAN_URDU_STT_PROMPT.lower())
 
+# Substring containment alone (the original check) is too loose: short,
+# common Roman Urdu words ("hai", "aap") are themselves substrings of the
+# prompt text, so a real one-word reply would get misidentified as an echo
+# and silently dropped. Requiring a run of several consecutive prompt words
+# keeps the check precise for actual prompt leakage while no longer
+# swallowing legitimate short replies.
+_MIN_ECHO_MATCH_WORDS = 3
+
+
+def _is_prompt_echo(text: str) -> bool:
+    """True if `text` is (a run of) the fixed Roman-Urdu prompt-bias text
+    coming back verbatim as a "transcription" - see
+    _ROMAN_URDU_STT_PROMPT_NORMALIZED above for why this leak happens and
+    why it's precisely detectable.
+    """
+    normalized = re.sub(r"[.,?!]", "", text.strip().lower())
+    words = normalized.split()
+    if len(words) < _MIN_ECHO_MATCH_WORDS:
+        return False
+    return " ".join(words) in _ROMAN_URDU_STT_PROMPT_NORMALIZED
+
+
+# EDGE_CASES.md B6/G1 (ported from the fix-edge-cases branch - see
+# README's "What's different" section): Whisper is documented to
+# hallucinate plausible-sounding stock phrases on short, quiet, or
+# near-silent audio (a VAD false-trigger on a cough, a chair creak, the
+# fragmented clips the min_volume/stop_secs bug above was producing). These
+# come out as complete, grammatical sentences, not empty and not a
+# recognizable filler word, so nothing else here catches them. A
+# confidence-score cutoff alone can't distinguish them either - measured
+# directly in this project, hallucinated text on silence scores
+# competitively with real speech from this Whisper+Groq setup. This instead
+# denylists the specific stock phrases well-documented as Whisper's go-to
+# hallucinations (YouTube-outro-style boilerplate) - deliberately narrow
+# and substring-match on normalized text, so it can't accidentally swallow
+# a real, on-topic reply.
+_HALLUCINATION_PHRASES = {
+    "thank you for watching",
+    "thanks for watching",
+    "thank you for watching this video",
+    "please subscribe",
+    "subscribe to my channel",
+    "dont forget to subscribe",
+    "like and subscribe",
+    "see you in the next video",
+    "ill see you in the next video",
+    "thanks for listening",
+}
+
+
+def _looks_like_known_hallucination(text: str) -> bool:
+    """True if `text` contains one of Whisper's well-documented stock
+    hallucination phrases (see _HALLUCINATION_PHRASES above).
+
+    Normalizes to letters+spaces only before matching, since Whisper's
+    punctuation/casing for these varies ("Thanks for watching!" vs "thanks
+    for watching," vs "THANKS FOR WATCHING") - and matches by substring
+    containment, not exact equality, since real hallucinated transcripts
+    vary in surrounding wording while still reliably containing one of
+    these markers verbatim.
+    """
+    words_only = " ".join(re.sub(r"[^a-z\s]", "", text.lower()).split())
+    return any(phrase in words_only for phrase in _HALLUCINATION_PHRASES)
+
+
+def _reject_transcript_reason(text: str, confidence: float) -> str | None:
+    """Why a transcript candidate should be rejected, or None if it's good
+    enough to use as-is. Empty text is never "rejected" here - there's
+    nothing to reject, it just means no speech was heard, which is the
+    pipeline's existing behavior for silence.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return None
+    if confidence < _MIN_ACCEPTABLE_CONFIDENCE:
+        return f"confidence {confidence:.3f} below floor {_MIN_ACCEPTABLE_CONFIDENCE}"
+    if _is_prompt_echo(stripped):
+        return "echoed the Roman-Urdu prompt-bias text verbatim"
+    if _looks_like_known_hallucination(stripped):
+        return "matched a known Whisper hallucination phrase"
+    return None
+
+
+# Real transcripts in this project's own eval logs sit between roughly
+# -0.03 and -0.35 avg_logprob; a candidate this far below that range is
+# closer to noise than speech and gets rejected outright rather than
+# passed to the LLM as if someone said it.
+_MIN_ACCEPTABLE_CONFIDENCE = -0.85
+
+# Confirmed live in this project's own eval logs: "ur" was winning on
+# plainly English audio by margins as small as 0.002 (a coin-flip, not a
+# real signal), and by as much as 0.155 on a full English sentence
+# ("Can you describe the water cycle in a few sentences?", en=-0.383
+# ur=-0.228). "ur" must beat "en" by a real margin before it's trusted,
+# not just edge out a tie - this is the English-bias behavior the README
+# names as deliberately unported (SHORT_UTTERANCE_EN_BIAS on the
+# fix-edge-cases branch); it's needed here too now that real measurements
+# from this variant confirm the same coin-flip failure mode.
+_UR_CONFIDENCE_MARGIN = 0.25
+
+# Below this duration, Whisper's Roman-Urdu prompt-conditioning (see
+# _ROMAN_URDU_STT_PROMPT above) has the least real signal to compete
+# against and dominates the "ur" call's output the most - exactly the
+# fragmented-clip regime the VAD stop_secs bug above was producing.
+# Require a bigger margin before trusting "ur" on these short clips.
+_SHORT_UTTERANCE_SECS = 1.5
+_SHORT_UTTERANCE_UR_MARGIN = 0.45
+
+# A clip this short can't contain a real word - skip both API calls
+# entirely rather than spend two Groq requests transcribing noise. This is
+# the highest-hallucination-risk input class, so removing it outright is
+# more reliable than trying to filter its output after the fact.
+_MIN_AUDIO_DURATION_SECS = 0.4
+
+
+def _pick_bilingual_result(conf_en: float, conf_ur: float, duration_secs: float) -> str:
+    """Pure decision: which language candidate wins the bilingual STT
+    comparison. Returns "en" or "ur".
+
+    Factored out from BilingualGroqSTTService._transcribe so the
+    tie-breaking logic is unit-testable without a live API call. See
+    _UR_CONFIDENCE_MARGIN and _SHORT_UTTERANCE_UR_MARGIN above for why
+    "ur" needs to clear a margin rather than just edge out "en" on a raw
+    comparison.
+    """
+    margin = (
+        _SHORT_UTTERANCE_UR_MARGIN
+        if duration_secs < _SHORT_UTTERANCE_SECS
+        else _UR_CONFIDENCE_MARGIN
+    )
+    return "ur" if conf_ur >= conf_en + margin else "en"
+
 
 class BilingualGroqSTTService(GroqSTTService):
     """GroqSTTService constrained to a closed set of two languages: English and
@@ -860,14 +1079,29 @@ class BilingualGroqSTTService(GroqSTTService):
 
     Instead, each utterance is transcribed twice concurrently - once forced
     to `language="en"`, once forced to `language="ur"` (with a Roman-script
-    prompt bias - see `_ROMAN_URDU_STT_PROMPT` above) - and whichever result
-    has the higher average segment confidence (avg_logprob) wins. Forcing
-    removes the third-language misdetection failure mode entirely, since
-    Whisper is never given the option to guess anything else.
+    prompt bias - see `_ROMAN_URDU_STT_PROMPT` above) - and "ur" wins only
+    if it clears a real confidence margin over "en" (see
+    `_pick_bilingual_result`), not just a raw comparison. Forcing removes
+    the third-language misdetection failure mode entirely, since Whisper is
+    never given the option to guess anything else.
 
     Trade-off: this doubles Groq STT API calls per turn. Both calls run
     concurrently via asyncio.gather, so wall-clock latency is roughly the
-    slower of the two, not the sum - but token/request usage is 2x.
+    slower of the two, not the sum - but token/request usage is 2x (skipped
+    entirely below _MIN_AUDIO_DURATION_SECS).
+
+    A raw confidence comparison alone was confirmed live to be unreliable:
+    "ur" (prompt-conditioned toward fluent Roman Urdu - see
+    _ROMAN_URDU_STT_PROMPT) was winning on plainly English audio by
+    margins as small as 0.002, and Whisper's own hallucinations on
+    short/quiet clips score competitively with real speech regardless of
+    language. `_reject_transcript_reason` below screens the winner for a
+    confidence floor, a verbatim prompt-bias echo, and known stock
+    hallucination phrases; if the winner is rejected, the OTHER candidate
+    is tried before giving up - the original version blanked the winner's
+    text unconditionally, which threw away a good English transcript
+    whenever "ur" happened to win the raw comparison and then get
+    rejected as an echo.
 
     NOTE: The LLM is instructed (system prompt) to always reply in English
     regardless of input language. This was originally required because the
@@ -880,6 +1114,14 @@ class BilingualGroqSTTService(GroqSTTService):
     """
 
     async def _transcribe(self, audio: bytes) -> Transcription:
+        duration_secs = _wav_duration_secs(audio)
+        if duration_secs < _MIN_AUDIO_DURATION_SECS:
+            logger.debug(
+                f"STT bilingual: audio too short to transcribe "
+                f"({duration_secs:.2f}s < {_MIN_AUDIO_DURATION_SECS}s) - skipping."
+            )
+            return Transcription(text="")
+
         base_kwargs = {
             "file": ("audio.wav", audio, "audio/wav"),
             "model": self._settings.model,
@@ -904,27 +1146,40 @@ class BilingualGroqSTTService(GroqSTTService):
         )
 
         conf_en, conf_ur = _avg_logprob(result_en), _avg_logprob(result_ur)
-        winner, lang, conf = (
-            (result_en, "en", conf_en) if conf_en >= conf_ur else (result_ur, "ur", conf_ur)
-        )
+        candidates = {"en": (result_en, conf_en), "ur": (result_ur, conf_ur)}
 
-        # See _ROMAN_URDU_STT_PROMPT_NORMALIZED above: catches Whisper
-        # echoing the fixed prompt-bias text back as a "transcription" on
-        # quiet/near-silent audio, before it ever reaches the LLM as if it
-        # were something the user actually said.
-        winner_normalized = re.sub(r"[.,?!]", "", winner.text.strip().lower())
-        if winner_normalized and winner_normalized in _ROMAN_URDU_STT_PROMPT_NORMALIZED:
-            logger.warning(
-                f"STT echoed the Roman-Urdu prompt-bias text back verbatim "
-                f"(no real speech) - dropping: {winner.text!r}"
+        winner_lang = _pick_bilingual_result(conf_en, conf_ur, duration_secs)
+        loser_lang = "ur" if winner_lang == "en" else "en"
+        winner, conf = candidates[winner_lang]
+        loser, loser_conf = candidates[loser_lang]
+
+        # See _reject_transcript_reason above: catches a confidence floor
+        # miss, a verbatim prompt-bias echo, or a known Whisper stock
+        # hallucination phrase, before any of them ever reach the LLM as if
+        # the user actually said it.
+        reject_reason = _reject_transcript_reason(winner.text, conf)
+        if reject_reason:
+            logger.debug(
+                f"STT bilingual: rejected {winner_lang} candidate "
+                f"({reject_reason}): {winner.text!r}"
             )
-            winner.text = ""
+            # The winner being bad doesn't mean the loser was too - try it
+            # before giving up on the turn entirely.
+            fallback_reject_reason = _reject_transcript_reason(loser.text, loser_conf)
+            if not fallback_reject_reason:
+                logger.debug(
+                    f"STT bilingual: falling back to {loser_lang} candidate: "
+                    f"{loser.text!r}"
+                )
+                winner, winner_lang, conf = loser, loser_lang, loser_conf
+            else:
+                winner.text = ""
 
         # repr() is ASCII-safe: shows \uXXXX escapes for non-Latin chars so
         # you can spot it immediately if Whisper ever slips back into
         # native Urdu (Nastaliq) script instead of the intended Roman one.
         logger.debug(
-            f"STT bilingual pick: lang={lang} conf={conf:.3f} "
+            f"STT bilingual pick: lang={winner_lang} conf={conf:.3f} "
             f"(en={conf_en:.3f} ur={conf_ur:.3f}) text={repr(winner.text)}"
         )
         return winner
@@ -933,9 +1188,9 @@ class BilingualGroqSTTService(GroqSTTService):
 _HTML_TAG_PATTERN = re.compile(r"<[^>]*>")
 
 
-class TextSanitizer(FrameProcessor):
-    """Strips raw HTML tags from LLM output before it's delivered to the
-    client as an RTVI text message.
+class SanitizingGroqLLMService(GroqLLMService):
+    """GroqLLMService that strips raw HTML tags from its own text output
+    before any other processor - or pipecat's RTVI observer - ever sees it.
 
     Defensive, not a fix for an observed bug: the system prompt here allows
     normal written formatting (unlike the audio variant, which strips
@@ -947,38 +1202,49 @@ class TextSanitizer(FrameProcessor):
     injection risk. Cheap insurance given this variant is the only one
     whose system prompt invites rich formatting at all.
 
+    This used to be a separate downstream FrameProcessor (`text_sanitizer`
+    in the pipeline), but that never actually reached the client: pipecat's
+    RTVIObserver.on_push_frame fires the FIRST time it sees a given
+    frame.id, and `llm`'s own push_frame call - which happens before the
+    frame reaches any later pipeline stage - is that first sighting.
+    Marking `frame.id` as seen there means a downstream processor mutating
+    the same frame object and re-pushing it is a no-op as far as the
+    observer (and therefore the client) is concerned - the raw,
+    unsanitized text had already gone out (traced through pipecat's
+    RTVIObserver source, see observer.py's on_push_frame/_frames_seen; not
+    something with an observable symptom of its own to catch live, since
+    the downstream processor's warning log still fired normally).
+    Overriding push_frame here instead - the same hook LLMService itself
+    uses to stamp `skip_tts` before calling super().push_frame - runs
+    before that first observer sighting, so the client only ever sees the
+    already-clean text.
+
     Known limitation: operates per-fragment, since RTVI streams one
     "bot-llm-text" message per raw LLM token chunk rather than per complete
-    sentence (every LLMTextFrame is pushed to the client immediately,
-    unaggregated - see pipecat's RTVIObserver._handle_llm_text_frame).
-    Buffering into complete sentences first (like the audio variant's
-    TTSTextNormalizer does) would add latency before any text reaches the
-    client at all, defeating real-time streaming - a tag split exactly
-    across two separate streamed fragments could theoretically slip through
-    partially. A narrow, accepted trade-off for keeping streaming immediate.
+    sentence (every LLMTextFrame is pushed immediately, unaggregated - see
+    pipecat's RTVIObserver._handle_llm_text_frame). Buffering into complete
+    sentences first (like the audio variant's TTSTextNormalizer does) would
+    add latency before any text reaches the client at all, defeating
+    real-time streaming - a tag split exactly across two separate streamed
+    fragments could theoretically slip through partially. A narrow,
+    accepted trade-off for keeping streaming immediate.
 
     Mutates `frame.text` in place rather than replacing the frame - `Frame`
     is a plain (non-frozen) dataclass, so this is safe, and it matters here
-    specifically: pipecat's RTVIObserver dedupes frames by `frame.id`,
-    which is auto-assigned in `__post_init__` and NOT preserved by
-    `dataclasses.replace()` (replace() reruns __init__, minting a fresh id
-    even when only `text` changed). Replacing the frame here previously
-    caused every streamed chunk to reach the client twice - once when `llm`
-    pushed the original frame, again when this processor pushed a
-    replacement whose new id the observer's dedup logic couldn't recognize
-    as the same frame.
+    specifically: `dataclasses.replace()` reruns `__init__`, minting a
+    fresh `frame.id` even when only `text` changed, and a frame with a new
+    id wouldn't be recognized by the observer as the one `llm`'s superclass
+    push_frame call is about to push right after this returns - it would
+    read as a second, distinct frame and reach the client twice.
     """
 
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        await super().process_frame(frame, direction)
+    async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
         if isinstance(frame, TextFrame) and frame.text:
             sanitized = _HTML_TAG_PATTERN.sub("", frame.text)
             if sanitized != frame.text:
                 logger.warning(f"Stripped HTML-like tag from LLM output: {frame.text!r}")
                 frame.text = sanitized
-            await self.push_frame(frame, direction)
-            return
-        await self.push_frame(frame, direction)
+        await super().push_frame(frame, direction)
 
 
 async def _startup_self_check(llm: GroqLLMService) -> None:
@@ -1042,19 +1308,30 @@ async def _push_standalone_text_message(worker: PipelineWorker, text: str) -> No
 
 
 async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
-    # whisper-large-v3-turbo instead of whisper-large-v3: cuts STT TTFB
-    # from ~3s to ~0.3-0.5s (a 6-10x reduction), which matters more here
-    # than usual since every utterance already pays for two concurrent
-    # transcription calls (see BilingualGroqSTTService). Known trade-off:
-    # Whisper's turbo variants are documented to trade a little accuracy
-    # for speed, more noticeably on less-common languages/accents than
-    # clean English.
+    # whisper-large-v3, not the turbo variant: switched after a real
+    # --local session where multiple turns came back with real speech
+    # transcribed as different, wrong words (not hallucinated on
+    # silence/noise - genuinely spoken audio, misrecognized). None of
+    # BilingualGroqSTTService's hallucination/echo/confidence-floor
+    # safeguards can catch that class of error, since those only target
+    # text that was never spoken at all - a confidently wrong transcript
+    # of real speech sails past all three untouched. Turbo's own docs
+    # already flag exactly this trade-off (speed for accuracy, more
+    # noticeable on less-common languages/accents); this pipeline's dual
+    # bilingual decode plus forced language selection may be making it
+    # worse. Costs real latency: full whisper-large-v3 measured ~3s TTFB
+    # in this project's earlier testing vs turbo's ~0.3-0.5s, and every
+    # utterance already pays for two concurrent transcription calls (see
+    # BilingualGroqSTTService), so this roughly doubles perceived STT
+    # latency again on top of that. Revert to "whisper-large-v3-turbo" if
+    # that latency turns out to matter more than the accuracy gain in
+    # practice.
     stt = BilingualGroqSTTService(
         api_key=os.environ["GROQ_API_KEY"],
-        settings=GroqSTTService.Settings(model="whisper-large-v3-turbo"),
+        settings=GroqSTTService.Settings(model="whisper-large-v3"),
     )
 
-    llm = GroqLLMService(
+    llm = SanitizingGroqLLMService(
         api_key=os.environ["GROQ_API_KEY"],
         settings=GroqLLMService.Settings(
             # First entry in LLM_MODEL_FALLBACK_CHAIN - Groq's dedicated
@@ -1093,18 +1370,47 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
         # 13 false turns in 80s of a real session, each one a different
         # Whisper hallucination from near-silent audio (not the
         # prompt-echo bug, which is a separate, already-fixed issue -
-        # these were genuinely different phrases every time). Raised to
-        # require louder, more confident audio before committing to a
-        # turn. start_secs deliberately left at its default (0.2) -
-        # raising it to 0.3 was tried and reverted: it measurably delayed
+        # these were genuinely different phrases every time). confidence
+        # was raised to 0.75 (above typical ambient noise, below where
+        # real speech dips on unvoiced consonants/low-energy vowels) to
+        # fix that.
+        #
+        # min_volume was ALSO raised to 0.7 in that same pass, and that
+        # part was wrong: min_volume is compared against an
+        # exponentially-smoothed volume (see pipecat's
+        # audio/utils.py:exp_smoothing, factor=0.2), so after n 32ms
+        # frames the smoothed value is only V*(1-0.8^n) of the true
+        # loudness V - reaching 0.7 needs ~12 consecutive loud frames
+        # (~390ms), and never triggers at all for a speaker whose
+        # normalized loudness sits under 0.7. Confirmed live: real
+        # utterances were getting fragmented mid-sentence and Whisper was
+        # hallucinating fluent-sounding text from the resulting short
+        # low-signal clips (see BilingualGroqSTTService for the
+        # downstream half of that same bug). min_volume is the wrong knob
+        # for ambient-noise rejection given the smoothing lag - reverted
+        # to its default (0.6); confidence alone is the discriminative
+        # signal against room noise.
+        #
+        # stop_secs was left at its default (0.2) in the original pass
+        # and is the actual cause of the mid-sentence fragmentation:
+        # natural speech pauses (commas, breath, thinking) run
+        # 300-800ms, so any of them was ending the turn early. Raised to
+        # 0.8 - still leaves timeout = max(0, GROQ_TTFS_P99 - stop_secs)
+        # = 1.54 - 0.8 = 0.74s positive, so this doesn't collapse
+        # TurnAnalyzerUserTurnStopStrategy's STT wait timeout to 0
+        # (pipecat warns exactly about that case). Logs one harmless
+        # "VAD stop_secs differs from the recommended default" startup
+        # warning as a result - expected, not a fault.
+        #
+        # start_secs deliberately left at its default (0.2) - raising it
+        # to 0.3 was tried and reverted: it measurably delayed
         # recognizing short, real interruptions ("Wait, stop, never
-        # mind.") past interrupted_context_test's 4s window. confidence/
-        # min_volume filter WHETHER something counts as speech; start_secs
-        # controls how fast a real interruption gets caught - only the
-        # former needed tightening here.
+        # mind.") past interrupted_context_test's 4s window. Barge-in
+        # latency is driven by start_secs, not stop_secs, so raising
+        # stop_secs above doesn't reopen that regression.
         user_params=LLMUserAggregatorParams(
             vad_analyzer=SileroVADAnalyzer(
-                params=VADParams(confidence=0.85, min_volume=0.7)
+                params=VADParams(confidence=0.75, min_volume=0.6, stop_secs=0.8)
             )
         ),
         # Bulletproofing: a long-running conversation would otherwise grow
@@ -1192,15 +1498,12 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
 
             _track_background_task(_correct_interrupted_context())
 
-    text_sanitizer = TextSanitizer()
-
     pipeline = Pipeline(
         [
             transport.input(),  # Mic input
             stt,  # Speech -> text
             user_aggregator,  # Collect user turn
-            llm,  # Generate response (text delivered to the client via RTVI below)
-            text_sanitizer,  # Strip any raw HTML tags before the client sees them
+            llm,  # Generate response + strip raw HTML tags (SanitizingGroqLLMService)
             transport.output(),  # Delivers RTVI text messages to the client - no TTS/audio
             assistant_aggregator,  # Collect assistant turn
         ]
@@ -1261,10 +1564,20 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
             primary_model = LLM_MODEL_FALLBACK_CHAIN[0]
             logger.warning(
                 f"Retrying primary LLM model {primary_model!r} after "
-                f"{MODEL_FALLBACK_RESET_SECS:.0f}s on a fallback model."
+                f"{MODEL_FALLBACK_RESET_SECS:.0f}s on a fallback model/key."
             )
             current_model_index = 0
-            current_key_index = 0
+            if current_key_index != 0:
+                # A key switch (see on_pipeline_error's key-fallback branch)
+                # rebuilds llm._client against the backup key - that has to
+                # be undone here too, not just the index bookkeeping, or
+                # every future turn keeps hitting the backup key's quota
+                # even after this reset "completes".
+                current_key_index = 0
+                llm._client = llm.create_client(
+                    api_key=GROQ_API_CHAIN[0],
+                    base_url="https://api.groq.com/openai/v1",
+                )
             llm._settings.model = primary_model
 
         # A second rate limit before the previous timer fires should push
@@ -1325,23 +1638,56 @@ async def run_bot(transport: BaseTransport, *, handle_sigint: bool = False):
                 f"model to {next_model!r} for subsequent turns."
             )
             _schedule_model_fallback_reset()
+            # LLM_MODEL_FALLBACK_CHAIN is ordered strongest-first (see its
+            # own comment) - every step down it moves to a model with a
+            # smaller tokens-per-minute budget. Confirmed live: a real
+            # session's accumulated context (history + tool schemas) that
+            # fit comfortably under the primary model's budget came back
+            # as a hard 413 "request too large" the very next turn against
+            # the fallback's smaller one - not a transient "wait and
+            # retry" case, a structural one that keeps failing every turn
+            # until the context actually shrinks (context summarization
+            # only fires automatically past its own token/message-count
+            # thresholds, which the primary model's larger budget may not
+            # have reached yet). Forcing it now, rather than waiting for
+            # that normal trigger, means the NEXT turn - the one that
+            # actually uses this smaller model - has a real chance of
+            # fitting. Only fires if enable_auto_context_summarization is
+            # actually on (see LLMAssistantAggregatorParams above) -
+            # otherwise no summarizer is listening for this frame at all.
+            await worker.queue_frame(LLMSummarizeContextFrame())
         elif error_frame_is_rate_limit(frame) and current_key_index + 1 < len(GROQ_API_CHAIN):
-            current_key_index += 1
-            current_model_index = 0
-            llm._settings.model = LLM_MODEL_FALLBACK_CHAIN[current_model_index]
-            # create_client() defaults base_url to None if not passed -
-            # that would point the rebuilt client at OpenAI's real API
-            # instead of Groq's, since AsyncOpenAI's own default is used
-            # otherwise. Must match the base_url the original
-            # GroqLLMService construction used.
-            llm._client = llm.create_client(
-                api_key=GROQ_API_CHAIN[current_key_index],
-                base_url="https://api.groq.com/openai/v1",
-            )
-            logger.error(
-                f"Rate limit hit on every model for the current API key - "
-                f"switching to backup key #{current_key_index + 1}."
-            )
+            next_key_index = current_key_index + 1
+            try:
+                # create_client() defaults base_url to None if not passed -
+                # that would point the rebuilt client at OpenAI's real API
+                # instead of Groq's, since AsyncOpenAI's own default is used
+                # otherwise. Must match the base_url the original
+                # GroqLLMService construction used. Wrapped: a failure here
+                # (e.g. a malformed key) shouldn't skip the user-facing
+                # apology message below - it should just mean the key
+                # switch didn't happen this time.
+                next_client = llm.create_client(
+                    api_key=GROQ_API_CHAIN[next_key_index],
+                    base_url="https://api.groq.com/openai/v1",
+                )
+            except Exception as e:
+                logger.error(f"Failed to switch to backup API key #{next_key_index + 1}: {e}")
+            else:
+                current_key_index = next_key_index
+                current_model_index = 0
+                llm._settings.model = LLM_MODEL_FALLBACK_CHAIN[current_model_index]
+                llm._client = next_client
+                logger.error(
+                    f"Rate limit hit on every model for the current API key - "
+                    f"switching to backup key #{current_key_index + 1}."
+                )
+                # A key switch needs the same "move back to primary after a
+                # cooldown" behavior a model switch already gets - without
+                # this call, a backup key, once switched to, stayed in use
+                # for the rest of the process's life even after the
+                # primary key's rate-limit window reset.
+                _schedule_model_fallback_reset()
 
         # A failure in pipecat's own background context-summarization pass
         # has nothing to do with the user's actual, current turn - showing
@@ -1530,7 +1876,10 @@ if __name__ == "__main__":
     if "--local" in sys.argv:
         asyncio.run(run_local())
     else:
-        from pipecat.runner.run import RUNNER_HOST, RUNNER_PORT, main
+        from pathlib import Path
+
+        from fastapi.responses import FileResponse
+        from pipecat.runner.run import RUNNER_HOST, RUNNER_PORT, app, main
 
         # Mirrors pipecat's own --host/--port argparse defaults so this
         # check targets the same address the runner will actually bind.
@@ -1539,5 +1888,35 @@ if __name__ == "__main__":
             int(sys.argv[sys.argv.index("--port") + 1]) if "--port" in sys.argv else RUNNER_PORT
         )
         _check_port_available(host, port)
+
+        # Serves client/index.html on the SAME origin as /api/offer, so
+        # opening http://localhost:7860/ (rather than the file directly -
+        # a file:// origin) is the normal way to use this project's web
+        # client. Fixes a real bug: Chrome's microphone-permission grant
+        # for a file:// origin doesn't persist reliably, so every mute/
+        # unmute re-triggered the permission prompt - confirmed by tracing
+        # the actual mute call through pipecat's client-js ->
+        # small-webrtc-transport -> Daily's call-object setLocalAudio(),
+        # which is a plain non-destructive track.enabled toggle, not a
+        # stop/reacquire of the mic - the repeated prompt could only be
+        # coming from the browser's file:// origin handling, not this
+        # app's code. A real http:// origin doesn't have that problem.
+        # Also required for client/index.html's own same-origin assumption
+        # (see its BOT_OFFER_URL logic) to hold if this page is ever
+        # served from somewhere other than opened as a local file.
+        #
+        # Registered on pipecat's shared `app` object BEFORE calling
+        # main() (per pipecat.runner.run.app's own documented extension
+        # pattern) so this route wins the "/" path over pipecat's own
+        # root-redirect-to-its-prebuilt-UI route, which main() registers
+        # later - Starlette matches routes in registration order, first
+        # match wins. pipecat_ai_prebuilt's own UI (if installed) remains
+        # reachable directly at /client/ for anyone who wants it; this
+        # project doesn't use or reference it anywhere.
+        _client_index_path = Path(__file__).parent / "client" / "index.html"
+
+        @app.get("/", include_in_schema=False)
+        async def serve_web_client():
+            return FileResponse(_client_index_path, media_type="text/html")
 
         main()

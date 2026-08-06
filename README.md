@@ -16,6 +16,8 @@ This is a sibling variant of the voice-in/voice-out bot on the `fix-edge-cases` 
 
    Get a free key at https://console.groq.com. No other API keys are needed.
 
+   Optionally, add a second key as `GROQ_API_KEY_2` - if every model rate-limits on the first key's daily quota, the bot switches to this one automatically and back again after a cooldown (see the Notes section below). Skip this if one key is enough for your usage.
+
 2. Install dependencies (pinned to the exact versions this project is verified against):
 
    ```
@@ -40,9 +42,9 @@ Set `LOG_LEVEL=CONVO` to see just the conversation transcript (`User:`/`Bot:` li
 
 ## Web UI
 
-`client/index.html` is a small standalone chat page (no build step, no npm install) that connects to the bot's WebRTC endpoint using Pipecat's official `@pipecat-ai/client-js` + `@pipecat-ai/small-webrtc-transport` packages, loaded straight from a CDN. With `python bot.py` running, just open `client/index.html` directly in a browser and click "Connect & talk" - your speech shows up as a "You:" bubble, the bot's reply streams in as a "Bot:" bubble, styled with the same cyan/green split as the `--local` console.
+`client/index.html` is a small standalone chat page (no build step, no npm install) that connects to the bot's WebRTC endpoint using Pipecat's official `@pipecat-ai/client-js` + `@pipecat-ai/small-webrtc-transport` packages, loaded straight from a CDN. With `python bot.py` running, open **`http://localhost:7860/`** in a browser (`bot.py` now serves this file itself, same-origin as `/api/offer`) and click "Start talking" - your speech shows up as a "You:" bubble, the bot's reply streams in as a "Bot:" bubble.
 
-It talks to whatever `bot.py` is currently serving at `http://localhost:7860/api/offer` - nothing in `bot.py` had to change for this to work, since the backend already spoke RTVI correctly.
+Open it this way, not by double-clicking `client/index.html` from disk - a `file://` origin's microphone-permission grant doesn't reliably persist in Chrome, so mute/unmute kept re-triggering the permission prompt. The file can still technically be opened directly (its `BOT_OFFER_URL` logic falls back to `http://localhost:7860/api/offer` for a `file://` origin), but `http://localhost:7860/` is the one that doesn't have this problem.
 
 ## Tool-calling demo
 
@@ -83,16 +85,14 @@ This branch ported everything from the voice variant's hardening work that **isn
 
 Deliberately **not** ported — these are audio-input/STT-layer concerns, out of scope for this variant:
 - The backchannel filter (dropping "Mm-hmm"-style filler before it reaches the LLM)
-- Smart Turn / VAD calibration tuning
-- The Whisper-hallucination phrase filter
-- The Urdu-misclassification confidence bias tuning (`SHORT_UTTERANCE_EN_BIAS`)
 
-Practical consequence: this bot can still occasionally mistranscribe speech as Urdu script gibberish (especially speech with natural pauses/filler words — real human speech, not the clean synthesized audio the eval suite tests with), and that garbled input can in turn confuse the LLM's tool-calling into a malformed function call that Groq's API rejects outright. When that happens, the circuit breaker/fallback message correctly catches it and asks you to repeat yourself — the bot doesn't crash or hang, but the underlying transcription issue isn't fixed here. See `fix-edge-cases` for the full audio-pipeline hardening, including that fix.
+The following WERE ported here after real mistranscription/dropped-speech bugs were confirmed live in this variant's own eval logs (the practical consequence the original version of this section warned about): the Whisper-hallucination phrase filter, and the Urdu-misclassification English confidence bias (`_UR_CONFIDENCE_MARGIN`/`_SHORT_UTTERANCE_UR_MARGIN` in `BilingualGroqSTTService`). VAD (`confidence`/`min_volume`/`stop_secs`) has also been tuned directly against this variant's own measurements rather than reusing the voice variant's numbers verbatim - see the comment above `LLMUserAggregatorParams` in `run_bot`.
 
 ## Notes
 
 - `--local` uses `LocalAudioTransport` (your PC's mic directly via PyAudio, no browser).
-- STT (`BilingualGroqSTTService`) transcribes each utterance twice concurrently — once forced to English, once forced to Urdu — and keeps whichever result has higher confidence. Unlike the voice variant, there's no technical reason this bot couldn't reply in Urdu too (no TTS to crash) — the system prompt still forces English-only replies, kept as-is for behavioral consistency between the two variants.
-- STT model is `whisper-large-v3-turbo`, not `whisper-large-v3` — measured directly in this pipeline: ~6-10x faster (3s → 0.3-0.5s) with no observed accuracy regression in testing, though Whisper's turbo variants are documented to trade a little accuracy for speed on less-common languages/accents.
-- A `TextSanitizer` strips any raw HTML-like tags from LLM output before delivery — defensive (no observed bug), since this variant's system prompt uniquely allows rich formatting and a client that renders markdown-to-HTML without sanitizing would be at risk from any stray tag the LLM echoes back.
+- STT (`BilingualGroqSTTService`) transcribes each utterance twice concurrently — once forced to English, once forced to Urdu — and picks "ur" only if it clears a real confidence margin over "en", not just a raw comparison (a plain "higher confidence wins" comparison was confirmed live to pick "ur" on English audio by margins as small as 0.002). Unlike the voice variant, there's no technical reason this bot couldn't reply in Urdu too (no TTS to crash) — the system prompt still forces English-only replies, kept as-is for behavioral consistency between the two variants.
+- STT model is `whisper-large-v3` (the full model, not the turbo variant) — turbo was tried first and is ~6-10x faster (3s → 0.3-0.5s), but a real `--local` session surfaced genuine speech coming back misrecognized as different words (not hallucinated on silence - actually spoken audio, transcribed wrong), matching Whisper's own documented turbo trade-off. Switch back to `"whisper-large-v3-turbo"` in `run_bot` if the extra latency (STT already pays for two concurrent calls per utterance - see `BilingualGroqSTTService`) matters more than the accuracy gain for your use case.
+- `SanitizingGroqLLMService` strips any raw HTML-like tags from LLM output before it's pushed at all — defensive (no observed injection), since this variant's system prompt uniquely allows rich formatting and a client that renders markdown-to-HTML without sanitizing would be at risk from any stray tag the LLM echoes back. This has to happen at the LLM service's own `push_frame` (not a separate downstream processor) because pipecat's RTVI observer sends a frame's content to the client the first time it sees that `frame.id` - which happens when `llm` pushes it, before any later pipeline stage runs.
+- An optional `GROQ_API_KEY_2` in `.env` extends the daily token quota: if every model in `LLM_MODEL_FALLBACK_CHAIN` rate-limits on the primary key, the bot switches to this second key automatically (see `GROQ_API_CHAIN` / `on_pipeline_error` in `bot.py`) and switches back after a cooldown with no further rate limits. Optional - the bot runs fine with just `GROQ_API_KEY`.
 - See `EDGE_CASES.md` for the original edge-case audit this whole project started from — note its header explains most of it is about the *voice* variant specifically.

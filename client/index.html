@@ -488,6 +488,9 @@
     // its own, so the two can be explained differently.
     let endedByUser = false;
 
+    const ERROR_AUTO_HIDE_MS = 10000;
+    let errorAutoHideTimer = null;
+
     function showError(text) {
       // Text goes into its own child span, not the banner's textContent
       // directly - the action buttons are sibling elements that have to
@@ -496,10 +499,19 @@
       // CSS can actually animate in/out instead of an instant show/hide.
       errorBannerTextEl.textContent = text;
       errorBannerEl.classList.add("visible");
+      // Each new error gets its own full window rather than stacking on
+      // top of a still-running one - a second error shouldn't get cut
+      // short by the first one's timer.
+      if (errorAutoHideTimer) clearTimeout(errorAutoHideTimer);
+      errorAutoHideTimer = setTimeout(clearError, ERROR_AUTO_HIDE_MS);
     }
 
     function clearError() {
       errorBannerEl.classList.remove("visible");
+      if (errorAutoHideTimer) {
+        clearTimeout(errorAutoHideTimer);
+        errorAutoHideTimer = null;
+      }
     }
 
     errorBannerCloseBtn.addEventListener("click", clearError);
@@ -577,6 +589,31 @@
     // the STT-done-but-LLM-still-generating gap instead of leaving the
     // bubble looking frozen/blank.
     let currentThinkingIndicator = null;
+    // The whole bubble wrapper currentThinkingIndicator lives inside -
+    // kept separately so a bubble that never got real text can be removed
+    // from the DOM entirely, not just have its JS references dropped. See
+    // removeUnresolvedThinkingBubble below.
+    let currentBotWrapper = null;
+
+    // A tool-calling turn fires BotLlmStarted/BotLlmStopped once per
+    // intermediate step (function-call, then function-result) with no real
+    // text before the actual answer - mirrors exactly what bot.py's
+    // on_assistant_turn_stopped does server-side for the same reason (see
+    // its comment: "printing those would just flash blank lines instead of
+    // masking the wait as intended"). If BotLlmStopped fires and the
+    // thinking indicator is still there, this bubble never resolved into a
+    // real reply - it's a dead end, not a message, so it's removed
+    // outright instead of being left behind as a permanently-"Thinking..."
+    // ghost bubble in the transcript. Also used on an unexpected
+    // disconnect that happens mid-turn, for the same reason.
+    function removeUnresolvedThinkingBubble() {
+      if (currentThinkingIndicator && currentBotWrapper) {
+        currentBotWrapper.remove();
+      }
+      currentBotBubble = null;
+      currentThinkingIndicator = null;
+      currentBotWrapper = null;
+    }
 
     function addMessage(role, text) {
       const wrapper = document.createElement("div");
@@ -611,7 +648,7 @@
       wrapper.appendChild(body);
       messagesEl.appendChild(wrapper);
       messagesEl.scrollTop = messagesEl.scrollHeight;
-      return { body, indicator };
+      return { body, indicator, wrapper };
     }
 
     function setStatus(text, state) {
@@ -650,8 +687,7 @@
     client.on(RTVIEvent.Disconnected, () => {
       setStatus("Ended", "");
       setPhase("ended");
-      currentBotBubble = null;
-      currentThinkingIndicator = null;
+      removeUnresolvedThinkingBubble();
       // A drop the user didn't ask for needs explaining; one they triggered
       // with the End button does not.
       if (!endedByUser) {
@@ -684,9 +720,10 @@
     });
 
     client.on(RTVIEvent.BotLlmStarted, () => {
-      const { body, indicator } = addThinkingBubble();
+      const { body, indicator, wrapper } = addThinkingBubble();
       currentBotBubble = body;
       currentThinkingIndicator = indicator;
+      currentBotWrapper = wrapper;
     });
 
     client.on(RTVIEvent.BotLlmText, (data) => {
@@ -707,8 +744,7 @@
     });
 
     client.on(RTVIEvent.BotLlmStopped, () => {
-      currentBotBubble = null;
-      currentThinkingIndicator = null;
+      removeUnresolvedThinkingBubble();
       setStatus("Listening", "live");
     });
 
@@ -727,6 +763,7 @@
       messagesEl.innerHTML = "";
       currentBotBubble = null;
       currentThinkingIndicator = null;
+      currentBotWrapper = null;
       setPhase("connecting");
       setStatus("Getting ready…", "busy");
       try {

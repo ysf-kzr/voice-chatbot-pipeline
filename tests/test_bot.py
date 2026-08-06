@@ -5,10 +5,11 @@ Groq connection, or real network access - the eval suite in evals/ already
 covers full pipeline behavior end-to-end (Kokoro-synthesized speech through
 the real bot). These run in well under a second and exist for the pieces
 that should never need several seconds and a live API key to verify -
-resolve_topic_slug's real-data cases below are the exact function/inputs
-used to measure the 30% topic-resolution hit rate that motivated adding the
-`enum` constraint to the tool schema; a test like this would have caught
-that regression immediately instead of needing a live session to surface it.
+resolve_topic_slug's real-data cases below are real topic strings this
+pipeline's LLM emitted in a live session, pinning the fuzzy fallback's
+current hit/miss behavior against them (see TestResolveTopicSlugRealData
+and TestBrowseToolSchemas for why an `enum` constraint was tried here and
+reverted, not adopted).
 
 Run (from the repo root, using the project's pinned venv):
     <path-to-venv>/Scripts/python.exe -m pytest tests/ -v
@@ -45,6 +46,41 @@ class TestAvgLogprob:
         result = type("Result", (), {"segments": segments})()
         assert bot._avg_logprob(result) == 0.0
 
+    @staticmethod
+    def _segment(avg_logprob, start, end):
+        return type("Segment", (), {"avg_logprob": avg_logprob, "start": start, "end": end})()
+
+    def test_weights_by_segment_duration_when_available(self):
+        # A 0.1s segment at -0.05 and a 1.9s segment at -0.5: a flat mean
+        # would be -0.275, but the long segment should dominate since it
+        # covers almost all of the audio.
+        segments = [self._segment(-0.05, 0.0, 0.1), self._segment(-0.5, 0.1, 2.0)]
+        result = type("Result", (), {"segments": segments})()
+        expected = (-0.05 * 0.1 + -0.5 * 1.9) / 2.0
+        assert bot._avg_logprob(result) == pytest.approx(expected)
+
+    def test_a_long_segment_dominates_a_short_outlier_within_one_transcript(self):
+        # What duration weighting actually changes vs. a flat mean: within
+        # a SINGLE transcript, a long real segment now dominates the
+        # overall score, instead of a short outlier segment (e.g. a brief
+        # burst of noise scored differently than the surrounding real
+        # speech) pulling the average further than its share of the audio
+        # warrants.
+        segments = [self._segment(-0.15, 0.0, 2.9), self._segment(-0.9, 2.9, 3.0)]
+        result = type("Result", (), {"segments": segments})()
+        weighted = bot._avg_logprob(result)
+        flat_mean = (-0.15 + -0.9) / 2
+        assert weighted > flat_mean
+        assert weighted == pytest.approx((-0.15 * 2.9 + -0.9 * 0.1) / 3.0)
+
+    def test_falls_back_to_flat_mean_when_segments_carry_no_duration(self):
+        # Hand-built segments with no start/end (as in
+        # test_computes_mean_of_segment_logprobs above) shouldn't divide by
+        # zero - they fall back to the original flat mean.
+        segments = [self._segment(-0.1, 0.0, 0.0), self._segment(-0.3, 0.0, 0.0)]
+        result = type("Result", (), {"segments": segments})()
+        assert bot._avg_logprob(result) == pytest.approx(-0.2)
+
 
 class TestResolveTopicSlug:
     SLUGS = {"civic": "civic-standard", "hr-v": "hrv-vti", "about honda": "abouthonda"}
@@ -65,6 +101,26 @@ class TestResolveTopicSlug:
     def test_empty_slug_dict_returns_none(self):
         assert bot.resolve_topic_slug("anything", {}) is None
 
+    def test_empty_topic_returns_none(self):
+        # Regression test: an empty string is a substring of every dict
+        # key, so the old "topic in key" fuzzy fallback matched the first
+        # key unconditionally - resolve_topic_slug("", HONDA_PAGE_SLUGS)
+        # used to resolve to "civic-standard".
+        assert bot.resolve_topic_slug("", self.SLUGS) is None
+
+    def test_whitespace_only_topic_returns_none(self):
+        assert bot.resolve_topic_slug("   ", self.SLUGS) is None
+
+    def test_single_char_topic_returns_none(self):
+        assert bot.resolve_topic_slug("a", self.SLUGS) is None
+
+    def test_topic_just_at_the_minimum_length_can_still_fuzzy_match(self):
+        # 3 chars is the minimum length allowed through to the fuzzy
+        # fallback - confirms the guard doesn't block a legitimate short
+        # topic that's a real substring of a key ("cit" in "city").
+        slugs = {"city": "city1-2l"}
+        assert bot.resolve_topic_slug("cit", slugs) == "city1-2l"
+
 
 class TestResolveTopicSlugRealData:
     """Regression tests against the actual production slug dicts, using
@@ -72,13 +128,12 @@ class TestResolveTopicSlugRealData:
     (captured from server logs) - not synthetic examples.
 
     The "still miss" cases below are documented gaps in the fuzzy fallback
-    alone, not bugs to fix here - they're exactly what motivated adding
-    the `enum` constraint to the tool schema (see make_browse_page_tool)
-    rather than trying to patch the matching heuristic itself, which can't
-    reliably guess arbitrary free-text phrasing. The enum now stops the
-    model from emitting most of these in normal operation; this function
-    is defense-in-depth for whatever still gets through, not the primary
-    safeguard - so these are pinned as known behavior, not xfail.
+    alone, not bugs to fix here - an `enum` constraint on the tool schema
+    was tried for exactly these cases and reverted (see
+    make_browse_page_tool's comment and TestBrowseToolSchemas below: it
+    caused an 83% hard-400 rate against Groq). Free-text + this fuzzy
+    fallback is the primary safeguard now, not defense-in-depth for an
+    enum - these misses are pinned as known behavior, not xfail.
     """
 
     @pytest.mark.parametrize(
@@ -106,6 +161,113 @@ class TestResolveTopicSlugRealData:
     )
     def test_real_topics_that_still_miss_the_fuzzy_fallback(self, page_slugs, topic):
         assert bot.resolve_topic_slug(topic, page_slugs) is None
+
+
+def _make_wav_bytes(duration_secs, sample_rate=16000):
+    import wave
+    from io import BytesIO
+
+    num_frames = int(duration_secs * sample_rate)
+    buf = BytesIO()
+    with wave.open(buf, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(b"\x00\x00" * num_frames)
+    return buf.getvalue()
+
+
+class TestWavDurationSecs:
+    def test_computes_duration_from_frame_count_and_rate(self):
+        audio = _make_wav_bytes(1.5, sample_rate=16000)
+        assert bot._wav_duration_secs(audio) == pytest.approx(1.5, abs=0.01)
+
+    def test_zero_length_audio_is_zero_duration(self):
+        audio = _make_wav_bytes(0.0)
+        assert bot._wav_duration_secs(audio) == 0.0
+
+    def test_malformed_audio_returns_zero_rather_than_raising(self):
+        assert bot._wav_duration_secs(b"not a real wav file") == 0.0
+
+
+class TestPickBilingualResult:
+    def test_en_wins_a_raw_tie(self):
+        # Regression case for the original bug: a bare `conf_en >= conf_ur`
+        # comparison let "ur" win coin-flip ties on plainly English audio.
+        assert bot._pick_bilingual_result(-0.2, -0.2, duration_secs=5.0) == "en"
+
+    def test_en_wins_when_ur_is_ahead_but_below_the_margin(self):
+        margin = bot._UR_CONFIDENCE_MARGIN
+        assert bot._pick_bilingual_result(-0.383, -0.383 + margin - 0.01, duration_secs=5.0) == "en"
+
+    def test_ur_wins_once_it_clears_the_margin(self):
+        margin = bot._UR_CONFIDENCE_MARGIN
+        assert bot._pick_bilingual_result(-0.383, -0.383 + margin + 0.01, duration_secs=5.0) == "ur"
+
+    def test_short_utterance_requires_the_larger_margin(self):
+        short_margin = bot._SHORT_UTTERANCE_UR_MARGIN
+        normal_margin = bot._UR_CONFIDENCE_MARGIN
+        conf_en = -0.3
+        conf_ur = conf_en + normal_margin + 0.01  # clears the normal margin...
+        assert conf_ur - conf_en < short_margin  # ...but not the short-utterance one
+        assert (
+            bot._pick_bilingual_result(conf_en, conf_ur, duration_secs=0.5) == "en"
+        )
+        assert (
+            bot._pick_bilingual_result(conf_en, conf_ur, duration_secs=5.0) == "ur"
+        )
+
+
+class TestIsPromptEcho:
+    def test_full_prompt_text_is_an_echo(self):
+        assert bot._is_prompt_echo("Mujhe iski qeemat maloom karni hai.") is True
+
+    def test_short_common_word_is_not_an_echo(self):
+        # Regression case: the original substring-containment check flagged
+        # any short word that happens to be a substring of the prompt text
+        # ("hai" is literally inside "...karni hai.") as an echo, silently
+        # dropping a legitimate one-word reply.
+        assert bot._is_prompt_echo("hai") is False
+        assert bot._is_prompt_echo("aap") is False
+
+    def test_unrelated_text_is_not_an_echo(self):
+        assert bot._is_prompt_echo("Compare the Honda Civic to the MG HS") is False
+
+
+class TestLooksLikeKnownHallucination:
+    def test_detects_a_known_stock_phrase(self):
+        assert bot._looks_like_known_hallucination("Thanks for watching!") is True
+
+    def test_detects_a_known_phrase_with_surrounding_words(self):
+        assert bot._looks_like_known_hallucination("Okay, please subscribe to my channel!") is True
+
+    def test_real_speech_is_not_flagged(self):
+        assert bot._looks_like_known_hallucination("What does the Honda Civic cost?") is False
+
+
+class TestRejectTranscriptReason:
+    def test_accepts_a_normal_confident_transcript(self):
+        assert bot._reject_transcript_reason("What is the water cycle?", -0.2) is None
+
+    def test_empty_text_is_never_rejected(self):
+        assert bot._reject_transcript_reason("", -5.0) is None
+        assert bot._reject_transcript_reason("   ", -5.0) is None
+
+    def test_rejects_below_the_confidence_floor(self):
+        floor = bot._MIN_ACCEPTABLE_CONFIDENCE
+        reason = bot._reject_transcript_reason("some text", floor - 0.01)
+        assert reason is not None
+        assert "confidence" in reason
+
+    def test_rejects_a_prompt_echo_even_at_high_confidence(self):
+        reason = bot._reject_transcript_reason("Mujhe iski qeemat maloom karni hai.", -0.05)
+        assert reason is not None
+        assert "echo" in reason
+
+    def test_rejects_a_known_hallucination_phrase_even_at_high_confidence(self):
+        reason = bot._reject_transcript_reason("Thanks for watching!", -0.05)
+        assert reason is not None
+        assert "hallucination" in reason
 
 
 class TestBrowseToolSchemas:
@@ -197,10 +359,11 @@ def _make_error_frame(exception=None, error_text=""):
     return type("FakeErrorFrame", (), {"exception": exception, "error": error_text})()
 
 
-def _make_openai_error(error_cls, status_code):
+def _make_openai_error(error_cls, status_code, code=None):
     request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
     response = httpx.Response(status_code, request=request)
-    return error_cls("test error", response=response, body=None)
+    body = {"message": "test error", "type": "tokens", "code": code} if code else None
+    return error_cls("test error", response=response, body=body)
 
 
 class TestErrorFrameIsRateLimit:
@@ -228,6 +391,37 @@ class TestErrorFrameIsRateLimit:
 
     def test_falls_back_to_text_heuristic_and_can_still_return_false(self):
         frame = _make_error_frame(exception=None, error_text="connection timed out")
+        assert bot.error_frame_is_rate_limit(frame) is False
+
+    def test_true_for_a_413_carrying_groqs_rate_limit_exceeded_code(self):
+        # Regression test for a real live case: Groq returns HTTP 413 (not
+        # 429) when a single request's token count already exceeds a
+        # model's entire per-minute budget - openai-python only maps 429
+        # to RateLimitError, so this used to fall into the generic
+        # APIStatusError bucket and get trusted as "definitely not a rate
+        # limit" (see test_false_for_a_different_typed_exception... above),
+        # skipping model/key fallback entirely for exactly the case
+        # fallback exists for. Confirmed live: Groq's own error body still
+        # carries code="rate_limit_exceeded" on this 413.
+        exc = _make_openai_error(openai.APIStatusError, 413, code="rate_limit_exceeded")
+        frame = _make_error_frame(exception=exc, error_text="doesn't matter")
+        assert bot.error_frame_is_rate_limit(frame) is True
+
+    def test_false_for_a_413_without_the_rate_limit_code(self):
+        # A 413 for some other reason (no rate-limit code in the body)
+        # must not be swept in just because the status code matches the
+        # regression case above.
+        exc = _make_openai_error(openai.APIStatusError, 413, code="something_else")
+        frame = _make_error_frame(exception=exc, error_text="doesn't matter")
+        assert bot.error_frame_is_rate_limit(frame) is False
+
+    def test_false_for_a_400_without_a_rate_limit_code(self):
+        # test_false_for_a_different_typed_exception_even_if_text_mentions_429
+        # above already covers this with body=None (code=None); this
+        # covers the same "not a rate limit" outcome now that BadRequestError
+        # is also an APIError and goes through the new .code check.
+        exc = _make_openai_error(openai.BadRequestError, 400, code="invalid_request_error")
+        frame = _make_error_frame(exception=exc, error_text="doesn't matter")
         assert bot.error_frame_is_rate_limit(frame) is False
 
 
@@ -267,6 +461,25 @@ class TestLlmModelFallbackChain:
 
     def test_all_entries_are_non_empty_strings(self):
         assert all(isinstance(m, str) and m for m in bot.LLM_MODEL_FALLBACK_CHAIN)
+
+
+class TestGroqApiChain:
+    def test_contains_no_falsy_entries(self):
+        # Regression test: GROQ_API_KEY_2 used to be appended unconditionally
+        # via os.environ.get(), so this list always had length 2 (with a
+        # None second entry) for anyone who hadn't set a real second key -
+        # which made on_pipeline_error's key-fallback branch reachable and
+        # crashed trying to build a client with api_key=None.
+        assert all(bot.GROQ_API_CHAIN)
+
+    def test_length_matches_number_of_real_keys_actually_set(self):
+        # Environment-dependent (a real GROQ_API_KEY_2 may or may not be
+        # set, locally or in CI) - the regression guard is that the chain's
+        # length always tracks the real environment, never a hardcoded 2.
+        import os
+
+        expected = len([k for k in (os.environ["GROQ_API_KEY"], os.environ.get("GROQ_API_KEY_2")) if k])
+        assert len(bot.GROQ_API_CHAIN) == expected
 
 
 class TestCheckPortAvailable:

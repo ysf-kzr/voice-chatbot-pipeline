@@ -12,6 +12,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # Harmless to skip for these tests (nothing here makes a real API call),
 # but importing bot.py at all would otherwise kill the whole test session
 # before a single test runs. setdefault() only kicks in if nothing's set
-# yet - a real .env's key (loaded by bot.py's own load_dotenv(override=True))
-# still wins if one happens to be present.
+# yet - a real .env's key (loaded by bot.py's own load_dotenv()) still wins
+# if one happens to be present in the actual environment.
 os.environ.setdefault("GROQ_API_KEY", "test-key-not-used-for-real-requests")
